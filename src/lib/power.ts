@@ -56,5 +56,6 @@ export async function setOutletPower(outlet: number, action: "on" | "off" | "boo
   }
 
   await runSerial([action, String(outlet)]);
+  await new Promise((resolve) => setTimeout(resolve, 800));
   return getOutletsWithState();
 }

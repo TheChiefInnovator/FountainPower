@@ -99,7 +99,7 @@ def main():
         "off": "/Off",
         "boot": "/Boot",
     }[args.action]
-    raw = run_command(args.device, f"{command} {args.outlet}", args.password)
+    raw = run_command(args.device, f"{command} {args.outlet},y", args.password)
     print(json.dumps({"state": args.action, "raw": raw}))
 
 
