@@ -11,7 +11,7 @@ export default async function Home() {
   const session = getSessionFromCookies(cookieStore);
 
   if (!session) {
-    redirect("/power/api/auth/launch");
+    redirect("/api/auth/launch");
   }
 
   const outlets = await getOutletsWithState();
