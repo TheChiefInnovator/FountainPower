@@ -26,5 +26,12 @@ export async function POST(request: NextRequest, context: Context) {
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   }
 
-  return NextResponse.json({ outlets: await setOutletPower(outlet, body.action) });
+  try {
+    return NextResponse.json({ outlets: await setOutletPower(outlet, body.action) });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Power action failed." },
+      { status: 400 },
+    );
+  }
 }

@@ -163,6 +163,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
               const isPending = pendingOutlet === outlet.outlet;
               const isEditing = editing?.outlet === outlet.outlet;
               const isOn = outlet.state === "on";
+              const cannotPowerOff = isOn && !outlet.canPowerOff;
 
               return (
                 <div
@@ -199,8 +200,9 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                   <div className="col-start-2 flex items-center gap-2 sm:col-start-auto">
                     <button
                       type="button"
-                      disabled={isPending || outlet.state === "unknown"}
+                      disabled={isPending || outlet.state === "unknown" || cannotPowerOff}
                       onClick={() => runAction(outlet, isOn ? "off" : "on")}
+                      title={cannotPowerOff ? "FountainSeven hosts this app; use power cycle instead." : "Toggle power"}
                       className={cn(
                         "inline-flex h-8 w-[92px] items-center rounded-full border px-1 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-55",
                         isOn

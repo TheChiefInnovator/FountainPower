@@ -17,6 +17,7 @@ Required values:
 - `POWER_SESSION_SECRET`: at least 32 random characters.
 - `POWER_SERIAL_PASSWORD`: WTI serial console password.
 - `POWER_SERIAL_DEVICE`: serial adapter path.
+- `POWER_PROTECTED_OFF_OUTLETS`: comma-separated outlet numbers that cannot be turned off.
 - `POWER_DB_PATH`: SQLite database path.
 - `COOLIFY_VALIDATE_URL`: Coolify URL used to validate the signed-in session cookie.
 

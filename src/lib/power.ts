@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 export type OutletState = "on" | "off" | "unknown";
 
 export type OutletView = OutletRecord & {
+  canPowerOff: boolean;
   state: OutletState;
 };
 
@@ -19,6 +20,15 @@ type SerialResult = {
 
 function serialScriptPath() {
   return path.join(process.cwd(), "scripts", "wti_serial.py");
+}
+
+function protectedOffOutlets() {
+  return new Set(
+    (process.env.POWER_PROTECTED_OFF_OUTLETS ?? "5")
+      .split(",")
+      .map((value) => Number(value.trim()))
+      .filter((value) => Number.isInteger(value) && value >= 1 && value <= 8),
+  );
 }
 
 async function runSerial(args: string[]) {
@@ -43,9 +53,11 @@ export async function readPowerStates() {
 
 export async function getOutletsWithState(): Promise<OutletView[]> {
   const [records, states] = await Promise.all([Promise.resolve(getOutletRecords()), readPowerStates()]);
+  const protectedOutlets = protectedOffOutlets();
 
   return records.map((record) => ({
     ...record,
+    canPowerOff: !protectedOutlets.has(record.outlet),
     state: states[String(record.outlet)] ?? "unknown",
   }));
 }
@@ -53,6 +65,10 @@ export async function getOutletsWithState(): Promise<OutletView[]> {
 export async function setOutletPower(outlet: number, action: "on" | "off" | "boot") {
   if (!Number.isInteger(outlet) || outlet < 1 || outlet > 8) {
     throw new Error("Outlet must be between 1 and 8.");
+  }
+
+  if (action === "off" && protectedOffOutlets().has(outlet)) {
+    throw new Error("This outlet hosts the power-control app and cannot be turned off. Use power cycle instead.");
   }
 
   await runSerial([action, String(outlet)]);
