@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { PowerConsole } from "@/components/power-console";
 import { getOutletsWithState } from "@/lib/power";
 import { getSessionFromCookies } from "@/lib/auth";
@@ -11,7 +11,15 @@ export default async function Home() {
   const session = getSessionFromCookies(cookieStore);
 
   if (!session) {
-    redirect("/api/auth/launch");
+    const headerStore = await headers();
+    const proto = headerStore.get("x-forwarded-proto") ?? "https";
+    const host = headerStore.get("x-forwarded-host") ?? headerStore.get("host");
+
+    if (host) {
+      redirect(`${proto}://${host}/power/api/auth/launch`);
+    }
+
+    redirect("/power/api/auth/launch");
   }
 
   const outlets = await getOutletsWithState();

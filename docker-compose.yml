@@ -1,0 +1,33 @@
+services:
+  fountainpower:
+    build:
+      context: https://github.com/TheChiefInnovator/FountainPower.git#main
+    restart: unless-stopped
+    ports:
+      - "3091:3040"
+    environment:
+      NODE_ENV: production
+      PORT: "3040"
+      POWER_PUBLIC_URL: https://coolify.theci.io/power
+      POWER_SESSION_SECRET: ${POWER_SESSION_SECRET}
+      POWER_SESSION_TTL_SECONDS: "900"
+      POWER_LAUNCH_TTL_SECONDS: "60"
+      POWER_CONTROL_DRIVER: http
+      POWER_WTI_BASE_URL: http://192.168.1.150
+      POWER_WTI_USERNAME: ${POWER_WTI_USERNAME}
+      POWER_WTI_PASSWORD: ${POWER_WTI_PASSWORD}
+      POWER_WTI_HTTP_TIMEOUT_MS: "7000"
+      POWER_PROTECTED_OFF_OUTLETS: "5"
+      POWER_DB_PATH: /app/data/power.sqlite
+      COOLIFY_VALIDATE_URL: https://coolify.theci.io/
+    volumes:
+      - fountainpower-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3040/power/api/health | grep -q '\"ok\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  fountainpower-data:
