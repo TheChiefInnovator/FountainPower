@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getOutletRecords, type OutletRecord } from "@/lib/db";
@@ -20,7 +21,7 @@ type SerialResult = {
   raw?: string;
 };
 
-type PowerDriver = "serial" | "http";
+type PowerDriver = "serial" | "http" | "telnet";
 
 type WtiHttpResponse = {
   body: string;
@@ -36,6 +37,10 @@ function powerDriver(): PowerDriver {
 
   if (driver === "http" || driver === "web") {
     return "http";
+  }
+
+  if (driver === "telnet" || driver === "network") {
+    return "telnet";
   }
 
   return "serial";
@@ -166,10 +171,128 @@ async function setHttpOutletPower(outlet: number, action: "on" | "off" | "boot")
   }
 }
 
+function telnetHost() {
+  return process.env.POWER_WTI_TELNET_HOST ?? "192.168.1.150";
+}
+
+function telnetPort() {
+  return Number(process.env.POWER_WTI_TELNET_PORT ?? 23);
+}
+
+function telnetPassword() {
+  const password = process.env.POWER_WTI_TELNET_PASSWORD ?? process.env.POWER_WTI_PASSWORD;
+
+  if (!password) {
+    throw new Error("POWER_WTI_TELNET_PASSWORD or POWER_WTI_PASSWORD must be set for Telnet power control.");
+  }
+
+  return password;
+}
+
+function telnetTimeoutMs() {
+  return Number(process.env.POWER_WTI_TELNET_TIMEOUT_MS ?? 8000);
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function telnetCommand(command: string) {
+  const attempts = Number(process.env.POWER_WTI_TELNET_ATTEMPTS ?? 3);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await runTelnetCommand(command);
+    } catch (error) {
+      lastError = error;
+      await wait(750 * attempt);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("WTI Telnet command failed.");
+}
+
+function runTelnetCommand(command: string) {
+  return new Promise<string>((resolve, reject) => {
+    const socket = net.createConnection({ host: telnetHost(), port: telnetPort() });
+    const timeout = setTimeout(() => {
+      socket.destroy(new Error("WTI Telnet command timed out."));
+    }, telnetTimeoutMs());
+    let raw = "";
+    let settled = false;
+
+    function finish(error?: Error) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve(raw);
+      }
+    }
+
+    socket.on("data", (chunk) => {
+      raw += chunk.toString("latin1");
+    });
+    socket.on("error", finish);
+
+    socket.on("connect", async () => {
+      try {
+        await wait(350);
+        socket.write(`${telnetPassword()}\r`);
+        await wait(650);
+        socket.write(`${command}\r`);
+        await wait(2600);
+        socket.write("/X\r");
+        finish();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error("WTI Telnet command failed."));
+      }
+    });
+  });
+}
+
+async function readTelnetPowerStates() {
+  return parseTelnetStates(await telnetCommand("/S"));
+}
+
+function parseTelnetStates(raw: string) {
+  const states: Record<string, OutletState> = {};
+  const clean = raw.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ");
+  const rowPattern = /\b([1-8])\s+\|\s+[^|]*\|\s+[^|]*\|\s+(ON|OFF)\s+\|/gi;
+
+  for (const row of clean.matchAll(rowPattern)) {
+    states[row[1]] = row[2].toLowerCase() as OutletState;
+  }
+
+  return states;
+}
+
+async function setTelnetOutletPower(outlet: number, action: "on" | "off" | "boot") {
+  const command = {
+    boot: "/Boot",
+    off: "/Off",
+    on: "/On",
+  }[action];
+
+  await telnetCommand(`${command} ${outlet},y`);
+}
+
 export async function readPowerStates() {
   try {
     if (powerDriver() === "http") {
       return await readHttpPowerStates();
+    }
+
+    if (powerDriver() === "telnet") {
+      return await readTelnetPowerStates();
     }
 
     const result = await runSerial(["status"]);
@@ -202,6 +325,8 @@ export async function setOutletPower(outlet: number, action: "on" | "off" | "boo
 
   if (powerDriver() === "http") {
     await setHttpOutletPower(outlet, action);
+  } else if (powerDriver() === "telnet") {
+    await setTelnetOutletPower(outlet, action);
   } else {
     await runSerial([action, String(outlet)]);
   }

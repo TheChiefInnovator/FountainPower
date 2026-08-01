@@ -15,11 +15,16 @@ cp .env.example .env.local
 Required values:
 
 - `POWER_SESSION_SECRET`: at least 32 random characters.
-- `POWER_CONTROL_DRIVER`: `http` for the WTI web form API, or `serial` for the local serial-console fallback.
+- `POWER_CONTROL_DRIVER`: `telnet` for the WTI network text API, `http` for the WTI web form API, or `serial` for the local serial-console fallback.
 - `POWER_WTI_BASE_URL`: WTI base URL, usually `http://192.168.1.150`.
 - `POWER_WTI_USERNAME`: WTI web username.
 - `POWER_WTI_PASSWORD`: WTI web password.
 - `POWER_WTI_HTTP_TIMEOUT_MS`: WTI HTTP request timeout.
+- `POWER_WTI_TELNET_HOST`: WTI Telnet host, usually `192.168.1.150`.
+- `POWER_WTI_TELNET_PORT`: WTI Telnet port, usually `23`.
+- `POWER_WTI_TELNET_PASSWORD`: WTI System Password for the network text interface. Defaults to `POWER_WTI_PASSWORD` when unset.
+- `POWER_WTI_TELNET_TIMEOUT_MS`: WTI Telnet command timeout.
+- `POWER_WTI_TELNET_ATTEMPTS`: retry attempts for the WTI Telnet command channel.
 - `POWER_SERIAL_PASSWORD`: WTI serial console password, required only when `POWER_CONTROL_DRIVER=serial`.
 - `POWER_SERIAL_DEVICE`: serial adapter path, required only when `POWER_CONTROL_DRIVER=serial`.
 - `POWER_PROTECTED_OFF_OUTLETS`: comma-separated outlet numbers that cannot be turned off.
@@ -28,7 +33,12 @@ Required values:
 
 ## Power Drivers
 
-Use `POWER_CONTROL_DRIVER=http` for redundant deployments. The HTTP driver talks to the WTI's classic HTML form API:
+Use `POWER_CONTROL_DRIVER=telnet` for redundant deployments. The Telnet driver talks to the WTI network text interface and uses the same commands as the serial driver:
+
+- `/S` reads outlet state.
+- `/On N,y`, `/Off N,y`, and `/Boot N,y` control outlets.
+
+Use `POWER_CONTROL_DRIVER=http` only when the WTI's classic HTML form API is stable:
 
 - `GET /plugs.htm` reads outlet state.
 - `POST /plugs` sends `plugN=On`, `plugN=Off`, or `plugN=Boot`.
