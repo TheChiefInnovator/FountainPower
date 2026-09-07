@@ -1,7 +1,7 @@
 "use client";
 
 import { Edit3, ExternalLink, Loader2, RefreshCw, RotateCcw, Save, X } from "lucide-react";
-import { useMemo, useState, useTransition } from "react";
+import { useState, useSyncExternalStore, useTransition } from "react";
 import { cn } from "@/lib/utils";
 import type { OutletView } from "@/lib/power";
 import { UNITS, type UnitId } from "@/lib/units";
@@ -18,6 +18,8 @@ type EditingState = {
   server: string;
 } | null;
 
+const subscribeToLocale = () => () => {};
+
 export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleProps) {
   const [outlets, setOutlets] = useState(initialOutlets);
   const [editing, setEditing] = useState<EditingState>(null);
@@ -26,13 +28,13 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
   const [isRefreshing, startRefresh] = useTransition();
 
   const onlineCount = outlets.filter((outlet) => outlet.state === "on").length;
-  const sessionExpires = useMemo(
-    () =>
-      new Intl.DateTimeFormat(undefined, {
+  const sessionExpires = useSyncExternalStore(
+    subscribeToLocale,
+    () => new Intl.DateTimeFormat(undefined, {
         hour: "numeric",
         minute: "2-digit",
       }).format(new Date(sessionExpiresAt * 1000)),
-    [sessionExpiresAt],
+    () => "—",
   );
 
   async function refresh() {

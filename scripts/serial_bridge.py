@@ -44,7 +44,7 @@ class Bridge(BaseHTTPRequestHandler):
         except (ValueError, AttributeError):
             self.reply(400, {"error": "Invalid outlet or action"})
             return
-        if not LOCK.acquire(timeout=1):
+        if not LOCK.acquire(timeout=10):
             self.reply(503, {"error": "Serial unit busy; retry shortly."})
             return
         try:
