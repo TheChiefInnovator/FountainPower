@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getOutletRecords, type OutletRecord } from "@/lib/db";
+import { UNITS, type UnitId } from "@/lib/units";
 
 const execFileAsync = promisify(execFile);
 
@@ -285,8 +286,26 @@ async function setTelnetOutletPower(outlet: number, action: "on" | "off" | "boot
   await telnetCommand(`${command} ${outlet},y`);
 }
 
-export async function readPowerStates() {
+async function serialBridge(action: "status" | "on" | "off" | "boot", outlet?: number) {
+  const url = process.env.POWER_UNIT2_BRIDGE_URL;
+  const token = process.env.POWER_UNIT2_BRIDGE_TOKEN;
+  if (!url || !token) throw new Error("Unit 2 serial bridge is not configured.");
+  const response = await fetch(`${url.replace(/\/+$/, "")}/${action === "status" ? "status" : "action"}`, {
+    method: action === "status" ? "GET" : "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    ...(action === "status" ? {} : { body: JSON.stringify({ action, outlet }) }),
+    signal: AbortSignal.timeout(25000),
+    cache: "no-store",
+  });
+  const data = await response.json() as SerialResult & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Unit 2 serial bridge failed.");
+  if (!data.states || Object.keys(data.states).length !== 8) throw new Error("Incomplete unit 2 status.");
+  return data.states;
+}
+
+export async function readPowerStates(unit: UnitId = 1) {
   try {
+    if (unit === 2) return await serialBridge("status");
     if (powerDriver() === "http") {
       return await readHttpPowerStates();
     }
@@ -304,26 +323,31 @@ export async function readPowerStates() {
 }
 
 export async function getOutletsWithState(): Promise<OutletView[]> {
-  const [records, states] = await Promise.all([Promise.resolve(getOutletRecords()), readPowerStates()]);
-  const protectedOutlets = protectedOffOutlets();
-
-  return records.map((record) => ({
-    ...record,
-    canPowerOff: !protectedOutlets.has(record.outlet),
-    state: states[String(record.outlet)] ?? "unknown",
-  }));
+  return (await Promise.all(UNITS.map(async ({ id }) => {
+    const records = getOutletRecords(id);
+    const states = await readPowerStates(id);
+    const protectedOutlets = id === 1 ? protectedOffOutlets() : new Set<number>();
+    return records.map((record) => ({
+      ...record,
+      canPowerOff: !protectedOutlets.has(record.outlet),
+      state: states[String(record.outlet)] ?? "unknown",
+    }));
+  }))).flat();
 }
 
-export async function setOutletPower(outlet: number, action: "on" | "off" | "boot") {
+export async function setOutletPower(outlet: number, action: "on" | "off" | "boot", unit: UnitId = 1) {
+  if (unit !== 1 && unit !== 2) throw new Error("Invalid power unit.");
   if (!Number.isInteger(outlet) || outlet < 1 || outlet > 8) {
     throw new Error("Outlet must be between 1 and 8.");
   }
 
-  if (action === "off" && protectedOffOutlets().has(outlet)) {
+  if (unit === 1 && action === "off" && protectedOffOutlets().has(outlet)) {
     throw new Error("This outlet hosts the power-control app and cannot be turned off. Use power cycle instead.");
   }
 
-  if (powerDriver() === "http") {
+  if (unit === 2) {
+    await serialBridge(action, outlet);
+  } else if (powerDriver() === "http") {
     await setHttpOutletPower(outlet, action);
   } else if (powerDriver() === "telnet") {
     await setTelnetOutletPower(outlet, action);

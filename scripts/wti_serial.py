@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -39,6 +40,8 @@ def read_available(fd, seconds):
 
 
 def run_command(device, command, password=None):
+    lock = open(os.environ.get("POWER_SERIAL_LOCK", "/tmp/fountain-power-serial.lock"), "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
 
     try:
@@ -59,6 +62,7 @@ def run_command(device, command, password=None):
         return read_available(fd, 2.5)
     finally:
         os.close(fd)
+        lock.close()
 
 
 def parse_states(raw):
@@ -71,9 +75,6 @@ def parse_states(raw):
         if len(columns) >= 4 and re.match(r"^[1-8]$", columns[0]) and columns[3] in ("ON", "OFF"):
             states[columns[0]] = columns[3].lower()
             continue
-
-        for outlet, state in re.findall(r"\b([1-8])\b[^0-9\r\n]{0,96}\b(ON|OFF)\b", upper):
-            states[outlet] = state.lower()
 
     return states
 

@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionFromCookies } from "@/lib/auth";
 import { updateOutlet } from "@/lib/db";
+import { parseUnit } from "@/lib/units";
 
 export const dynamic = "force-dynamic";
 
@@ -33,5 +34,10 @@ export async function PATCH(request: NextRequest, context: Context) {
     return NextResponse.json({ error: "Label is required" }, { status: 400 });
   }
 
-  return NextResponse.json({ outlet: updateOutlet(outlet, label, server) });
+  try {
+    const unit = parseUnit(request.nextUrl.searchParams.get("unit"));
+    return NextResponse.json({ outlet: updateOutlet(outlet, label, server, unit) });
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Update failed." }, { status: 400 });
+  }
 }

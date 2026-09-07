@@ -4,6 +4,7 @@ import { Edit3, ExternalLink, Loader2, RefreshCw, RotateCcw, Save, X } from "luc
 import { useMemo, useState, useTransition } from "react";
 import { cn } from "@/lib/utils";
 import type { OutletView } from "@/lib/power";
+import { UNITS, type UnitId } from "@/lib/units";
 
 type PowerConsoleProps = {
   initialOutlets: OutletView[];
@@ -11,6 +12,7 @@ type PowerConsoleProps = {
 };
 
 type EditingState = {
+  unit: UnitId;
   outlet: number;
   label: string;
   server: string;
@@ -19,7 +21,7 @@ type EditingState = {
 export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleProps) {
   const [outlets, setOutlets] = useState(initialOutlets);
   const [editing, setEditing] = useState<EditingState>(null);
-  const [pendingOutlet, setPendingOutlet] = useState<number | null>(null);
+  const [pendingOutlet, setPendingOutlet] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isRefreshing, startRefresh] = useTransition();
 
@@ -49,11 +51,11 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
   }
 
   async function runAction(outlet: OutletView, action: "on" | "off" | "boot") {
-    setPendingOutlet(outlet.outlet);
+    setPendingOutlet(`${outlet.unit}:${outlet.outlet}`);
     setError(null);
 
     try {
-      const response = await fetch(`/power/api/outlets/${outlet.outlet}/action`, {
+      const response = await fetch(`/power/api/outlets/${outlet.outlet}/action?unit=${outlet.unit}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ action }),
@@ -77,11 +79,11 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
       return;
     }
 
-    setPendingOutlet(editing.outlet);
+    setPendingOutlet(`${editing.unit}:${editing.outlet}`);
     setError(null);
 
     try {
-      const response = await fetch(`/power/api/outlets/${editing.outlet}`, {
+      const response = await fetch(`/power/api/outlets/${editing.outlet}?unit=${editing.unit}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: editing.label, server: editing.server }),
@@ -93,7 +95,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
       }
 
       setOutlets((current) =>
-        current.map((outlet) => (outlet.outlet === data.outlet?.outlet ? { ...outlet, ...data.outlet } : outlet)),
+        current.map((outlet) => (outlet.unit === data.outlet?.unit && outlet.outlet === data.outlet?.outlet ? { ...outlet, ...data.outlet } : outlet)),
       );
       setEditing(null);
     } catch (caught) {
@@ -138,9 +140,9 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
         </header>
 
         <section className="grid gap-3 border-b border-[var(--border)] py-4 sm:grid-cols-3">
-          <Metric label="Outlets on" value={`${onlineCount}/8`} />
+          <Metric label="Outlets on" value={`${onlineCount}/${outlets.length}`} />
           <Metric label="Session expires" value={sessionExpires} />
-          <Metric label="Serial device" value="/dev/cu.usbserial-FTEPND0D" />
+          <Metric label="Power units" value="2 · LAN + Serial" />
         </section>
 
         {error ? (
@@ -149,7 +151,11 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
           </div>
         ) : null}
 
-        <section className="mt-4 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--panel)]">
+        {UNITS.map((unit) => <section key={unit.id} aria-label={unit.label} className="mt-4 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--panel)]">
+          <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-3">
+            <h2 className="text-sm font-semibold">{unit.label} <span className="ml-2 font-normal text-zinc-400">{unit.connection}</span></h2>
+            <span className="text-xs text-zinc-400">{outlets.filter((outlet) => outlet.unit === unit.id && outlet.state === "on").length}/8 on</span>
+          </div>
           <div className="grid grid-cols-[72px_1fr] border-b border-[var(--border)] bg-zinc-950/45 px-3 py-2 text-xs font-medium uppercase tracking-normal text-zinc-500 sm:grid-cols-[72px_1.2fr_1.7fr_160px_168px]">
             <span>Outlet</span>
             <span>Label</span>
@@ -159,15 +165,15 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
           </div>
 
           <div className="divide-y divide-[var(--border)]">
-            {outlets.map((outlet) => {
-              const isPending = pendingOutlet === outlet.outlet;
-              const isEditing = editing?.outlet === outlet.outlet;
+            {outlets.filter((outlet) => outlet.unit === unit.id).map((outlet) => {
+              const isPending = pendingOutlet === `${outlet.unit}:${outlet.outlet}`;
+              const isEditing = editing?.unit === outlet.unit && editing?.outlet === outlet.outlet;
               const isOn = outlet.state === "on";
               const cannotPowerOff = isOn && !outlet.canPowerOff;
 
               return (
                 <div
-                  key={outlet.outlet}
+                  key={`${outlet.unit}:${outlet.outlet}`}
                   className="grid grid-cols-[72px_1fr] items-center gap-3 px-3 py-3 sm:grid-cols-[72px_1.2fr_1.7fr_160px_168px]"
                 >
                   <div className="font-mono text-sm text-zinc-400">#{outlet.outlet}</div>
@@ -200,7 +206,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                   <div className="col-start-2 flex items-center gap-2 sm:col-start-auto">
                     <button
                       type="button"
-                      disabled={isPending || outlet.state === "unknown" || cannotPowerOff}
+                      disabled={pendingOutlet !== null || outlet.state === "unknown" || cannotPowerOff}
                       onClick={() => runAction(outlet, isOn ? "off" : "on")}
                       title={cannotPowerOff ? "FountainSeven hosts this app; use power cycle instead." : "Toggle power"}
                       className={cn(
@@ -236,7 +242,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                         <IconButton
                           label="Power cycle"
                           onClick={() => runAction(outlet, "boot")}
-                          disabled={!isOn || isPending}
+                          disabled={!isOn || pendingOutlet !== null}
                         >
                           {isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
                         </IconButton>
@@ -244,6 +250,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                           label="Edit label"
                           onClick={() =>
                             setEditing({
+                              unit: outlet.unit,
                               outlet: outlet.outlet,
                               label: outlet.label,
                               server: outlet.server,
@@ -260,7 +267,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
               );
             })}
           </div>
-        </section>
+        </section>)}
       </div>
     </main>
   );

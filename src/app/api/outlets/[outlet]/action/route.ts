@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionFromCookies } from "@/lib/auth";
 import { setOutletPower } from "@/lib/power";
+import { parseUnit } from "@/lib/units";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +28,8 @@ export async function POST(request: NextRequest, context: Context) {
   }
 
   try {
-    return NextResponse.json({ outlets: await setOutletPower(outlet, body.action) });
+    const unit = parseUnit(request.nextUrl.searchParams.get("unit"));
+    return NextResponse.json({ outlets: await setOutletPower(outlet, body.action, unit) });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Power action failed." },
