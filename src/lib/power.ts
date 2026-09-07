@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { getOutletRecords, type OutletRecord } from "@/lib/db";
 import { UNITS, type UnitId } from "@/lib/units";
+import { inputDisconnected } from "@/lib/input-supply";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,6 +15,7 @@ export type OutletState = "on" | "off" | "unknown";
 export type OutletView = OutletRecord & {
   canPowerOff: boolean;
   state: OutletState;
+  inputDisconnected: boolean;
 };
 
 type SerialResult = {
@@ -331,6 +333,7 @@ export async function getOutletsWithState(): Promise<OutletView[]> {
       ...record,
       canPowerOff: !protectedOutlets.has(record.outlet),
       state: states[String(record.outlet)] ?? "unknown",
+      inputDisconnected: inputDisconnected(id, record.outlet),
     }));
   }))).flat();
 }

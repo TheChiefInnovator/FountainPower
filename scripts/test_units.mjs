@@ -19,6 +19,17 @@ function load(name) {
 }
 try {
   const db = load('db');
+  const {inputDisconnected} = load('input-supply');
+  process.env.POWER_DISCONNECTED_INPUT_BANKS = '2:B';
+  for (let outlet = 1; outlet <= 8; outlet++) {
+    assert.equal(inputDisconnected(1, outlet), false);
+    assert.equal(inputDisconnected(2, outlet), outlet >= 5);
+  }
+  process.env.POWER_DISCONNECTED_INPUT_BANKS = '';
+  assert.equal(inputDisconnected(2, 5), false);
+  process.env.POWER_DISCONNECTED_INPUT_BANKS = '2:C';
+  assert.throws(() => inputDisconnected(2, 5), /Invalid/);
+  delete process.env.POWER_DISCONNECTED_INPUT_BANKS;
   const {parseUnit} = load('units');
   assert.equal(parseUnit(null), 1);
   assert.equal(parseUnit('2'), 2);

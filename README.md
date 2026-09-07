@@ -8,7 +8,9 @@ The app is served from `/power` by redundant Coolify instances on FountainOne an
 
 The console groups outlets by unit. Action and label APIs accept `?unit=1` or `?unit=2`; omitting the parameter retains Unit 1 compatibility. Invalid unit IDs are rejected. Existing labels remain in the `outlets` table; Unit 2 labels are stored independently in `outlets_unit2`. Each Coolify replica has its own existing SQLite volume.
 
-Unit 2 MAC: `00-09-9b-01-12-83`. All eight outlets were turned on and verified. Assignments: 1 = FountainSix; 2 = eGPU #1 RTX 3090 Ti; 3 = eGPU #2 RTX 3090 Ti; 4–8 = unassigned.
+Unit 2 MAC: `00-09-9b-01-12-83`. All eight relays report ON, but the operator confirmed that its second input cord is disconnected: only outlets 1–4 have input power. The earlier verification confirmed relay status, not outlet voltage. Assignments: 1 = FountainSix; 2 = eGPU #1 RTX 3090 Ti; 3 = eGPU #2 RTX 3090 Ti; 4–8 = unassigned.
+
+`POWER_DISCONNECTED_INPUT_BANKS=2:B` records the disconnected second input in both Coolify app instances. Banks A and B correspond to outlets 1–4 and 5–8 respectively. This is operator-maintained wiring metadata, not automatic sensing. The API preserves switch-reported `state` and adds `inputDisconnected`; the UI shows NO INPUT POWER separately from Relay: ON and excludes those outlets from its on count. When the second cord is connected, clear `2:B` from this environment variable and redeploy both instances. Do not invent an OFF relay response to represent an absent input supply.
 
 Set `POWER_UNIT2_BRIDGE_URL=http://192.168.1.117:3041` and secret `POWER_UNIT2_BRIDGE_TOKEN` in both Coolify service stacks. The host bridge uses only the Python standard library; source is `scripts/serial_bridge.py` plus `scripts/wti_serial.py`. It serializes requests, verifies the switch MAC before accessing outlets, and reports incomplete reads as failures. No bridge credentials or raw console output are returned to browsers. Only the two app hosts and local host are permitted to connect.
 

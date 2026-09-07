@@ -27,7 +27,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
   const [error, setError] = useState<string | null>(null);
   const [isRefreshing, startRefresh] = useTransition();
 
-  const onlineCount = outlets.filter((outlet) => outlet.state === "on").length;
+  const onlineCount = outlets.filter((outlet) => outlet.state === "on" && !outlet.inputDisconnected).length;
   const sessionExpires = useSyncExternalStore(
     subscribeToLocale,
     () => new Intl.DateTimeFormat(undefined, {
@@ -147,6 +147,11 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
           <Metric label="Power units" value="2 · LAN + Serial" />
         </section>
 
+        <p className="mt-3 text-xs text-zinc-400">
+          ON/OFF reflects the relay setting, not measured voltage. Input connections are recorded manually;
+          outlets with a disconnected input are excluded from the on count.
+        </p>
+
         {error ? (
           <div className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
             {error}
@@ -156,8 +161,13 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
         {UNITS.map((unit) => <section key={unit.id} aria-label={unit.label} className="mt-4 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--panel)]">
           <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-3">
             <h2 className="text-sm font-semibold">{unit.label} <span className="ml-2 font-normal text-zinc-400">{unit.connection}</span></h2>
-            <span className="text-xs text-zinc-400">{outlets.filter((outlet) => outlet.unit === unit.id && outlet.state === "on").length}/8 on</span>
+            <span className="text-xs text-zinc-400">{outlets.filter((outlet) => outlet.unit === unit.id && outlet.state === "on" && !outlet.inputDisconnected).length}/8 on</span>
           </div>
+          {outlets.some((outlet) => outlet.unit === unit.id && outlet.inputDisconnected) && (
+            <p className="border-b border-[var(--border)] px-3 py-2 text-xs text-amber-200">
+              Input disconnected for outlets {outlets.filter((outlet) => outlet.unit === unit.id && outlet.inputDisconnected).map((outlet) => outlet.outlet).join(", ")} · operator confirmed.
+            </p>
+          )}
           <div className="grid grid-cols-[72px_1fr] border-b border-[var(--border)] bg-zinc-950/45 px-3 py-2 text-xs font-medium uppercase tracking-normal text-zinc-500 sm:grid-cols-[72px_1.2fr_1.7fr_160px_168px]">
             <span>Outlet</span>
             <span>Label</span>
@@ -206,6 +216,12 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                   </div>
 
                   <div className="col-start-2 flex items-center gap-2 sm:col-start-auto">
+                    {outlet.inputDisconnected ? (
+                      <div>
+                        <div className="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs font-semibold text-zinc-300">NO INPUT POWER</div>
+                        <div className="mt-1 text-xs text-zinc-500">Relay: {outlet.state.toUpperCase()}</div>
+                      </div>
+                    ) : (
                     <button
                       type="button"
                       disabled={pendingOutlet !== null || outlet.state === "unknown" || cannotPowerOff}
@@ -227,6 +243,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                         {outlet.state === "unknown" ? "UNK" : isOn ? "ON" : "OFF"}
                       </span>
                     </button>
+                    )}
                   </div>
 
                   <div className="col-span-2 flex justify-end gap-2 sm:col-span-1">
@@ -244,7 +261,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                         <IconButton
                           label="Power cycle"
                           onClick={() => runAction(outlet, "boot")}
-                          disabled={!isOn || pendingOutlet !== null}
+                          disabled={!isOn || outlet.inputDisconnected || pendingOutlet !== null}
                         >
                           {isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
                         </IconButton>
