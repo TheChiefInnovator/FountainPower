@@ -22,6 +22,8 @@
 
 # misc
 .DS_Store
+._*
+__pycache__/
 *.pem
 
 # debug
@@ -44,3 +46,5 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+__pycache__/
+._*

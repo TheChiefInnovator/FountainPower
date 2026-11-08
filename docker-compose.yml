@@ -27,6 +27,8 @@ services:
       POWER_UNIT2_BRIDGE_TOKEN: ${POWER_UNIT2_BRIDGE_TOKEN}
       POWER_DISCONNECTED_INPUT_BANKS: ${POWER_DISCONNECTED_INPUT_BANKS:-}
       POWER_DB_PATH: /app/data/power.sqlite
+      POWER_TEMPS_API_URL: ${POWER_TEMPS_API_URL}
+      POWER_TEMPS_API_TOKEN: ${POWER_TEMPS_API_TOKEN}
       COOLIFY_VALIDATE_URL: https://coolify.theci.io/
     volumes:
       - fountainpower-data:/app/data

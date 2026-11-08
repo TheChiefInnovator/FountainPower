@@ -122,6 +122,9 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
           </div>
 
           <div className="flex items-center gap-2">
+            <a href="/power/temperatures" className="inline-flex h-9 items-center rounded-md border border-[var(--border)] bg-[var(--panel)] px-3 text-sm font-medium text-zinc-100 transition hover:border-[var(--border-strong)]">
+              Temperatures
+            </a>
             <button
               type="button"
               onClick={refresh}

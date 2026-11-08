@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Pull fleet probes over forced-command SSH and expose a private read API."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import datetime as dt
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import math
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import parse_qs, urlsplit
+
+HOST_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+KINDS = {"cpu", "gpu", "nvme", "memory", "board", "network", "other"}
+UTC = dt.timezone.utc
+
+
+def iso(value):
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be text")
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp needs timezone")
+    return parsed.astimezone(UTC)
+
+
+def history_params(query):
+    try:
+        hours = min(720, max(1, int(query.get("hours", ["24"])[0])))
+    except (ValueError, TypeError, IndexError):
+        raise ValueError("hours must be an integer") from None
+    host = query.get("host", [None])[0]
+    if host is not None and not HOST_RE.fullmatch(host):
+        raise ValueError("invalid host")
+    if query.get("bucket", ["auto"])[0] != "auto":
+        raise ValueError("bucket must be auto")
+    return hours, host, 300 if hours <= 24 else 1800 if hours <= 168 else 7200
+
+
+def sql_text(value):
+    """Hex encode UTF-8: untrusted text cannot contain SQL or psql syntax."""
+    if value is None:
+        return "NULL"
+    return "convert_from(decode('" + str(value).encode("utf-8").hex() + "','hex'),'UTF8')"
+
+
+def sql_number(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("invalid number")
+    return str(value)
+
+
+def sweep_sql(samples, sweep_at, retention_days=None):
+    statements = ["BEGIN;"]
+    for index, sample in enumerate(samples):
+        values = [sql_text(sweep_at) + "::timestamptz", sql_text(sample.get("collected_at")) + "::timestamptz",
+                  sql_text(sample["host"]), sql_text(sample["status"]), sql_text(sample.get("error")),
+                  sql_number(sample.get("uptime_s")), sql_number(sample.get("load1")), str(len(sample["readings"])),
+                  sql_text(json.dumps(sample.get("warnings", []))) + "::jsonb"]
+        insert = ("INSERT INTO fountain.host_temperature_samples "
+                  "(sweep_at,collected_at,host,status,error,uptime_s,load1,readings_count,warnings) VALUES ("
+                  + ",".join(values) + ") RETURNING id")
+        if not sample["readings"]:
+            statements.append(insert + ";")
+            continue
+        rows = []
+        for sensor in sample["readings"]:
+            fields = [sql_text(sample["host"]), sql_text(sweep_at) + "::timestamptz"]
+            fields += [sql_text(sensor[key]) for key in ("kind", "chip", "device", "label")]
+            fields += [sql_number(sensor.get(key)) + "::real" for key in ("celsius", "max", "crit")]
+            rows.append("(" + ",".join(fields) + ")")
+        statements.append(f"WITH sample{index} AS ({insert}) INSERT INTO fountain.host_temperature_readings "
+                          "(sample_id,host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c) "
+                          f"SELECT sample{index}.id,v.* FROM sample{index} CROSS JOIN (VALUES "
+                          + ",".join(rows) + ") AS v(host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c);")
+    if retention_days is not None:
+        statements.append("DELETE FROM fountain.host_temperature_samples WHERE sweep_at < now() - "
+                          f"{int(retention_days)} * interval '1 day';")
+    statements.append("COMMIT;")
+    return "\n".join(statements)
+
+
+def latest_sql():
+    return """WITH latest AS (
+ SELECT DISTINCT ON (host) * FROM fountain.host_temperature_samples ORDER BY host,sweep_at DESC,id DESC
+), good AS (
+ SELECT host,max(collected_at) AS last_good_at FROM fountain.host_temperature_samples WHERE status='ok' GROUP BY host
+)
+SELECT json_build_object('sweep_at',(SELECT max(sweep_at) FROM latest),'hosts',coalesce(json_agg(
+ json_build_object('host',s.host,'status',s.status,'error',s.error,'collected_at',s.collected_at,
+ 'last_good_at',g.last_good_at,'uptime_s',s.uptime_s,'load1',s.load1,'warnings',s.warnings,
+ 'max_celsius',(SELECT max(celsius) FROM fountain.host_temperature_readings WHERE sample_id=s.id),
+ 'readings',coalesce((SELECT json_agg(json_build_object('kind',kind,'chip',chip,'device',device,'label',label,
+ 'celsius',celsius,'max',max_c,'crit',crit_c) ORDER BY kind,device,label)
+ FROM fountain.host_temperature_readings WHERE sample_id=s.id),'[]'::json)) ORDER BY s.host),'[]'::json))
+FROM latest s LEFT JOIN good g USING(host);
+"""
+
+
+def history_sql(start, end, host, bucket):
+    restriction = " AND host=" + sql_text(host) if host else ""
+    return f"""WITH buckets AS (
+ SELECT host,kind,to_timestamp(floor(extract(epoch FROM sweep_at)/{bucket})*{bucket}) AS at,max(celsius) AS c
+ FROM fountain.host_temperature_readings
+ WHERE sweep_at >= {sql_text(start)}::timestamptz AND sweep_at <= {sql_text(end)}::timestamptz {restriction}
+ GROUP BY host,kind,at
+), series AS (
+ SELECT host,kind,json_agg(json_build_array(at,c) ORDER BY at) AS points FROM buckets GROUP BY host,kind
+)
+SELECT json_build_object('from',{sql_text(start)},'to',{sql_text(end)},'bucket_seconds',{bucket},
+ 'series',coalesce(json_agg(row_to_json(series) ORDER BY host,kind),'[]'::json)) FROM series;
+"""
+
+
+class Database:
+    def run(self, sql, write=False):
+        role = "fountain_temps_writer" if write else "fountain_temps_reader"
+        command = ["docker", "exec", "-i", "coolify-db", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", role,
+                   "-d", "coolify", "-At"]
+        command += ["-f", "-"] if write else ["-c", sql]
+        result = subprocess.run(command, input=sql if write else None, capture_output=True, text=True,
+                                timeout=30, check=True)
+        return None if write else json.loads(result.stdout)
+
+    def store(self, samples, sweep_at, retention_days):
+        self.run(sweep_sql(samples, sweep_at, retention_days), write=True)
+
+    def latest(self):
+        return self.run(latest_sql())
+
+    def history(self, start, end, host, bucket):
+        return self.run(history_sql(start, end, host, bucket))
+
+
+class MemoryDatabase:
+    """Only selected by --dry-run. No Docker, database, or remote connections."""
+    def __init__(self):
+        self.samples = []
+        self.lock = threading.Lock()
+
+    def store(self, samples, sweep_at, retention_days):
+        with self.lock:
+            self.samples.extend(dict(sample, sweep_at=sweep_at) for sample in samples)
+            cutoff = dt.datetime.now(UTC) - dt.timedelta(days=retention_days or 180)
+            self.samples = [s for s in self.samples if parse_time(s["sweep_at"]) >= cutoff]
+
+    def latest(self):
+        with self.lock:
+            latest, good = {}, {}
+            for sample in self.samples:
+                if sample["status"] == "ok":
+                    good[sample["host"]] = sample["collected_at"]
+                latest[sample["host"]] = dict(sample)
+            hosts = [dict(sample, last_good_at=good.get(name),
+                          max_celsius=max((r["celsius"] for r in sample["readings"]), default=None))
+                     for name, sample in sorted(latest.items())]
+            return dict(sweep_at=max((s["sweep_at"] for s in hosts), default=None), hosts=hosts)
+
+    def history(self, start, end, host, bucket):
+        with self.lock:
+            groups = {}
+            for sample in self.samples:
+                if not parse_time(start) <= parse_time(sample["sweep_at"]) <= parse_time(end) or (host and host != sample["host"]):
+                    continue
+                at = iso(dt.datetime.fromtimestamp(int(parse_time(sample["sweep_at"]).timestamp()) // bucket * bucket, UTC))
+                for sensor in sample["readings"]:
+                    points = groups.setdefault((sample["host"], sensor["kind"]), {})
+                    points[at] = max(points.get(at, -40), sensor["celsius"])
+            return dict(bucket_seconds=bucket, series=[dict(host=h, kind=k, points=sorted(p.items()))
+                        for (h, k), p in sorted(groups.items())], **{"from": start, "to": end})
+
+
+def validate_payload(payload):
+    if not isinstance(payload, dict) or type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise ValueError("invalid schema")
+    collected_at = iso(parse_time(payload["collected_at"]))
+    sensors = payload.get("readings")
+    if not isinstance(sensors, list) or len(sensors) > 512:
+        raise ValueError("invalid readings")
+    readings = []
+    for sensor in sensors:
+        if not isinstance(sensor, dict) or sensor.get("kind") not in KINDS:
+            raise ValueError("invalid sensor")
+        clean = {}
+        for key in ("kind", "chip", "device", "label"):
+            value = sensor.get(key)
+            if not isinstance(value, str) or len(value) > 512 or "\0" in value:
+                raise ValueError("invalid sensor text")
+            value.encode("utf-8")
+            clean[key] = value
+        for key in ("celsius", "max", "crit"):
+            value = sensor.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or not -40 < value < 150):
+                raise ValueError("invalid temperature")
+            clean[key] = value
+        if clean["celsius"] is None:
+            raise ValueError("missing temperature")
+        readings.append(clean)
+    uptime, load = payload.get("uptime_s"), payload.get("load1")
+    if uptime is not None and (type(uptime) is not int or not 0 <= uptime < 2**63):
+        raise ValueError("invalid uptime")
+    if load is not None and (isinstance(load, bool) or not isinstance(load, (int, float)) or not math.isfinite(load) or not 0 <= load < 1e9):
+        raise ValueError("invalid load")
+    warnings = payload.get("warnings", [])
+    if not isinstance(warnings, list) or len(warnings) > 128 or any(not isinstance(w, str) or len(w) > 512 or "\0" in w for w in warnings):
+        raise ValueError("invalid warnings")
+    for warning in warnings:
+        warning.encode("utf-8")
+    return dict(collected_at=collected_at, readings=readings, uptime_s=uptime, load1=load, warnings=warnings)
+
+
+def probe(host, config, dry_run=False):
+    sample = dict(host=host["name"], status="ok", error=None, collected_at=None,
+                  readings=[], warnings=[], uptime_s=None, load1=None)
+    if dry_run:
+        command = [sys.executable, str(Path(__file__).resolve().parents[1] / "agent/fountain-temps")]
+    else:
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "IdentitiesOnly=yes", "-o", "UserKnownHostsFile=" + config.get("known_hosts", "/etc/fountain-temps/known_hosts"),
+                   "-i", config["key_path"]]
+        if host.get("jump"):
+            command += ["-J", host["jump"]]
+        command += ["-p", str(host["port"]), host["user"] + "@" + host["host"]]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=25, check=False)
+        if completed.returncode != 0:
+            sample.update(status="unreachable" if completed.returncode == 255 else "error",
+                          error="SSH connection failed" if completed.returncode == 255 else "temperature agent failed")
+        elif len(completed.stdout) > 1_000_000:
+            sample.update(status="error", error="agent response too large")
+        else:
+            sample.update(validate_payload(json.loads(completed.stdout)))
+    except subprocess.TimeoutExpired:
+        sample.update(status="unreachable", error="probe timed out")
+    except OSError:
+        sample.update(status="error", error="probe could not start")
+    except (ValueError, TypeError, KeyError, OverflowError):
+        sample.update(status="error", error="invalid agent response")
+    return sample
+
+
+def load_config(path, dry_run):
+    config = json.loads(Path(path).read_text())
+    config.setdefault("bind", "192.168.1.110:3096")
+    config.setdefault("interval", 300)
+    config.setdefault("retention_days", 180)
+    config.setdefault("key_path", "/etc/fountain-temps/id_ed25519")
+    config.setdefault("api_token_file", "/etc/fountain-temps/api-token")
+    if type(config["interval"]) is not int or not 1 <= config["interval"] <= 86400:
+        raise ValueError("invalid interval")
+    if type(config["retention_days"]) is not int or not 1 <= config["retention_days"] <= 3650:
+        raise ValueError("invalid retention_days")
+    names = set()
+    if not isinstance(config.get("hosts"), list) or len(config["hosts"]) > 256:
+        raise ValueError("invalid hosts list")
+    for host in config["hosts"]:
+        if not HOST_RE.fullmatch(host["name"]) or host["name"] in names:
+            raise ValueError("invalid or duplicate host name")
+        names.add(host["name"])
+        if dry_run:
+            if host.get("transport") != "local":
+                raise ValueError("dry-run hosts must use local transport")
+        else:
+            if host.get("transport", "ssh") != "ssh":
+                raise ValueError("production hosts must use SSH")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,253}", host["host"]) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", host["user"]):
+                raise ValueError("invalid SSH target")
+            if type(host["port"]) is not int or not 1 <= host["port"] <= 65535:
+                raise ValueError("invalid SSH port")
+            if host.get("jump") and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:,\[\]-]{0,255}", host["jump"]):
+                raise ValueError("invalid jump target")
+    token_path = Path(config["api_token_file"])
+    if stat.S_IMODE(token_path.stat().st_mode) != 0o600:
+        raise ValueError("api token file must have mode 0600")
+    token = token_path.read_text().strip()
+    if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
+        raise ValueError("api token must be at least 32 ASCII characters without whitespace")
+    return config, token
+
+
+class Collector:
+    def __init__(self, config, token, database, dry_run=False):
+        self.config, self.token, self.database, self.dry_run = config, token, database, dry_run
+        self.last_sweep_at = None
+        self.last_retention_day = None
+        self.stop = threading.Event()
+
+    def sweep(self, at):
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            samples = list(pool.map(lambda host: probe(host, self.config, self.dry_run), self.config["hosts"]))
+        today = dt.datetime.now(UTC).date()
+        retention = self.config["retention_days"] if today != self.last_retention_day else None
+        self.database.store(samples, at, retention)
+        self.last_retention_day = today
+        self.last_sweep_at = at
+
+    def loop(self):
+        interval = self.config["interval"]
+        while not self.stop.is_set():
+            now = time.time()
+            at = iso(dt.datetime.fromtimestamp(int(now // interval) * interval, UTC))
+            try:
+                self.sweep(at)
+                print(f"sweep {at}: {len(self.config['hosts'])} hosts recorded", flush=True)
+            except Exception:
+                # Do not leak SQL, sensor text, local paths, SSH stderr or tokens.
+                print("sweep storage failed", file=sys.stderr, flush=True)
+            self.stop.wait(max(0.1, (math.floor(time.time() / interval) + 1) * interval - time.time()))
+
+
+def handler_for(collector):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "FountainTemps/1"
+
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(10)
+
+        def log_message(self, *_args):
+            pass
+
+        def send_error(self, code, message=None, explain=None):
+            if code == 501 and not self.authorized(urlsplit(self.path).path):
+                return
+            self.reply(code, {"error": "Invalid HTTP request"})
+
+        def reply(self, status, payload):
+            body = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def authorized(self, path):
+            if path == "/health":
+                return True
+            actual = self.headers.get("Authorization", "").encode("utf-8")
+            expected = ("Bearer " + collector.token).encode("utf-8")
+            if not hmac.compare_digest(actual, expected):
+                self.reply(401, {"error": "Unauthorized"})
+                return False
+            return True
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if not self.authorized(url.path):
+                return
+            try:
+                if url.path == "/health":
+                    self.reply(200, dict(ok=True, last_sweep_at=collector.last_sweep_at, hosts=len(collector.config["hosts"])))
+                elif url.path == "/v1/latest":
+                    self.reply(200, collector.database.latest())
+                elif url.path == "/v1/history":
+                    try:
+                        hours, host, bucket = history_params(parse_qs(url.query, keep_blank_values=True, max_num_fields=16))
+                    except ValueError:
+                        self.reply(400, {"error": "Invalid history parameters"})
+                        return
+                    end = dt.datetime.now(UTC)
+                    self.reply(200, collector.database.history(iso(end - dt.timedelta(hours=hours)), iso(end), host, bucket))
+                else:
+                    self.reply(404, {"error": "Not found"})
+            except Exception:
+                self.reply(503, {"error": "Temperature storage unavailable"})
+
+        def unsupported(self):
+            if self.authorized(urlsplit(self.path).path):
+                self.reply(405, {"error": "Method not allowed"})
+
+        do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = unsupported
+
+    return Handler
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/fountain-temps/collector.json")
+    parser.add_argument("--dry-run", action="store_true", help="in-memory storage; local probes only")
+    args = parser.parse_args()
+    try:
+        config, token = load_config(args.config, args.dry_run)
+        address, port = config["bind"].rsplit(":", 1)
+        collector = Collector(config, token, MemoryDatabase() if args.dry_run else Database(), args.dry_run)
+        server = ThreadingHTTPServer((address, int(port)), handler_for(collector))
+    except Exception:
+        parser.exit(1, "Invalid collector configuration or bind address; check config and private token file.\n")
+    worker = threading.Thread(target=collector.loop, daemon=True)
+    worker.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        collector.stop.set()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

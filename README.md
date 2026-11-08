@@ -44,6 +44,10 @@ Required values:
 - `POWER_PROTECTED_OFF_OUTLETS`: comma-separated outlet numbers that cannot be turned off.
 - `POWER_DB_PATH`: SQLite database path.
 - `COOLIFY_VALIDATE_URL`: Coolify URL used to validate the signed-in session cookie.
+- `POWER_TEMPS_API_URL`: private temperature collector origin, e.g. `http://192.168.1.110:3096`.
+- `POWER_TEMPS_API_TOKEN`: private collector bearer token; never exposed to browsers. Set both temperature variables in both Coolify Power instances. Leaving either empty displays “Temperature service not configured”.
+
+The authenticated `/power/temperatures` dashboard shows fleet temperatures and up to 30 days of history. It refreshes every 60 seconds through the session-protected `/power/api/temperatures` proxy. The collector samples every five minutes and retains 180 days; it uses dedicated PostgreSQL roles inside `coolify-db`, without exposing PostgreSQL on the LAN. See [temperature installation and rollback](temps/install.md) for the agent, SSH restrictions, schema, collector configuration, and local dry-run commands.
 
 ## Power Drivers
 

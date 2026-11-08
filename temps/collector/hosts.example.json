@@ -1,0 +1,26 @@
+{
+  "key_path": "/etc/fountain-temps/id_ed25519",
+  "known_hosts": "/etc/fountain-temps/known_hosts",
+  "api_token_file": "/etc/fountain-temps/api-token",
+  "bind": "192.168.1.110:3096",
+  "interval": 300,
+  "retention_days": 180,
+  "hosts": [
+    { "name": "FountainSelf", "host": "127.0.0.1", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainOne", "host": "192.168.1.111", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainTwo", "host": "192.168.1.112", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainThree", "host": "192.168.1.113", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainFour", "host": "192.168.1.114", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainFive", "host": "192.168.1.115", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainSix", "host": "192.168.1.116", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainNine", "host": "192.168.1.119", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainTwenty", "host": "192.168.1.130", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainTwentyOne", "host": "192.168.1.131", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainTwentyTwo", "host": "192.168.1.132", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "FountainTwentyThree", "host": "192.168.1.133", "port": 50122, "user": "omarchy", "kind": "linux" },
+    { "name": "HappyBird", "host": "192.168.1.125", "port": 50122, "user": "omarchy", "kind": "linux", "note": "QEMU VM; zero sensors expected" },
+    { "name": "Omen", "host": "10.66.66.2", "port": 50122, "user": "miles", "kind": "linux", "note": "verify" },
+    { "name": "FountainSeven", "host": "192.168.1.117", "port": 22, "user": "mac", "kind": "macos" },
+    { "name": "FountainEight", "host": "192.168.1.118", "port": 50122, "user": "omarchy", "kind": "linux", "note": "Colima VM on FountainSeven; often down" }
+  ]
+}
