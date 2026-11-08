@@ -46,6 +46,28 @@ Required values:
 - `COOLIFY_VALIDATE_URL`: Coolify URL used to validate the signed-in session cookie.
 - `POWER_TEMPS_API_URL`: private temperature collector origin, e.g. `http://192.168.1.110:3096`.
 - `POWER_TEMPS_API_TOKEN`: private collector bearer token; never exposed to browsers. Set both temperature variables in both Coolify Power instances. Leaving either empty displays “Temperature service not configured”.
+- `POWER_LABELS_API_URL`: private collector origin for shared outlet labels, e.g. `http://192.168.1.110:3096`.
+- `POWER_LABELS_API_TOKEN`: **separate** label bearer token from `/etc/fountain-temps/labels-token`, never the temperature token. Set both label variables identically on both Power replicas. With either variable unset, label storage retains legacy local SQLite behavior.
+
+With shared labels enabled, both units read and edit the single PostgreSQL label
+table through the collector. Successful reads and edits refresh the local SQLite
+cache. During a collector outage, reads use that cache and the console shows
+“labels read-only: shared store unavailable”. Edits fail with a clear error and
+never save only to the replica. Refresh after recovery to re-enable editing.
+Outlet API envelopes remain `{outlets:[...]}` / `{outlet:...}`; cached rows carry
+an additive `readOnly: true` flag. Power switching still works during label outages.
+
+On the first shared read per unit in each app process, the replica offers its
+original SQLite rows as seeds with their `updatedAt` timestamps (SQLite's naive
+timestamps are UTC). Empty or incomplete units are seeded again on later reads.
+Each seed inserts missing rows; a conflicting seed may replace a prior seed only
+when its timestamp is newer. This also reconciles replicas that start after the
+first seed was already accepted. Equal timestamps retain the first accepted seed.
+An explicit label PUT permanently protects that row from subsequent seeds,
+regardless of timestamp. Shared label and server text must each contain 1–64
+trimmed characters without control characters; check legacy custom rows before
+enabling migration. See [label installation and rollback](temps/install.md#shared-outlet-labels)
+for the schema and separate token setup.
 
 The authenticated `/power/temperatures` dashboard shows fleet temperatures and up to 30 days of history. It refreshes every 60 seconds through the session-protected `/power/api/temperatures` proxy. The collector samples every five minutes and retains 180 days; it uses dedicated PostgreSQL roles inside `coolify-db`, without exposing PostgreSQL on the LAN. See [temperature installation and rollback](temps/install.md) for the agent, SSH restrictions, schema, collector configuration, and local dry-run commands.
 

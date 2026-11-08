@@ -6,6 +6,8 @@ import path from 'node:path';
 import ts from 'typescript';
 const require = createRequire(import.meta.url);
 const temp = mkdtempSync(path.join(tmpdir(), 'power-units-'));
+delete process.env.POWER_LABELS_API_URL;
+delete process.env.POWER_LABELS_API_TOKEN;
 process.env.POWER_DB_PATH = path.join(temp, 'test.sqlite');
 const modules = new Map();
 function load(name) {
@@ -35,12 +37,12 @@ try {
   assert.equal(parseUnit('2'), 2);
   assert.throws(() => parseUnit('3'));
   assert.throws(() => parseUnit(''));
-  db.updateOutlet(1, 'Existing custom label', 'Keep this', 1);
-  assert.equal(db.getOutletRecords(2)[0].label, 'FountainSix');
-  db.updateOutlet(1, 'Second unit edit', 'Unit two only', 2);
-  assert.equal(db.getOutletRecords(1)[0].label, 'Existing custom label');
-  assert.equal(db.getOutletRecords(2)[0].label, 'Second unit edit');
-  assert.equal(db.getOutletRecords(1).length + db.getOutletRecords(2).length, 16);
+  await db.updateOutlet(1, 'Existing custom label', 'Keep this', 1);
+  assert.equal((await db.getOutletRecords(2))[0].label, 'FountainSix');
+  await db.updateOutlet(1, 'Second unit edit', 'Unit two only', 2);
+  assert.equal((await db.getOutletRecords(1))[0].label, 'Existing custom label');
+  assert.equal((await db.getOutletRecords(2))[0].label, 'Second unit edit');
+  assert.equal((await db.getOutletRecords(1)).length + (await db.getOutletRecords(2)).length, 16);
   const power = load('power');
   await assert.rejects(power.setOutletPower(1, 'on', 3), /Invalid power unit/);
   await assert.rejects(power.setOutletPower(9, 'on', 2), /between 1 and 8/);

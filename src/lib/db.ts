@@ -13,6 +13,7 @@ export type OutletRecord = {
   server: string;
   sortOrder: number;
   updatedAt: string;
+  readOnly?: boolean;
 };
 
 const seedOutlets: Array<[number, string, string]> = [
@@ -76,7 +77,7 @@ export function initDb(unit: UnitId = 1) {
   }
 }
 
-export function getOutletRecords(unit: UnitId = 1) {
+function localOutletRecords(unit: UnitId = 1) {
   initDb(unit);
 
   const raw = sqlite(`
@@ -94,7 +95,122 @@ export function getOutletRecords(unit: UnitId = 1) {
   return JSON.parse(raw.trim() || "[]") as OutletRecord[];
 }
 
-export function updateOutlet(outlet: number, label: string, server: string, unit: UnitId = 1) {
+const seededUnits = new Set<string>();
+
+function sharedConfig() {
+  const url = process.env.POWER_LABELS_API_URL;
+  const token = process.env.POWER_LABELS_API_TOKEN;
+  return url && token ? { url, token } : null;
+}
+
+export class SharedLabelsUnavailable extends Error {
+  constructor() {
+    super("Labels read-only: shared store unavailable. Refresh and try again; no local-only edit was saved.");
+  }
+}
+
+async function sharedRequest(config: { url: string; token: string }, route: string, body?: unknown, method = "POST") {
+  const origin = new URL(config.url);
+  if (!["http:", "https:"].includes(origin.protocol) || origin.username || origin.password || origin.search || origin.hash) {
+    throw new SharedLabelsUnavailable();
+  }
+  const response = await fetch(`${origin.toString().replace(/\/$/, "")}${route}`, {
+    method: body === undefined ? "GET" : method,
+    headers: { Authorization: `Bearer ${config.token}`, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: "no-store",
+    redirect: "error",
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new SharedLabelsUnavailable();
+  return response.json() as Promise<unknown>;
+}
+
+function parseSharedRow(value: unknown): OutletRecord {
+  if (!value || typeof value !== "object") throw new SharedLabelsUnavailable();
+  const row = value as OutletRecord;
+  if ((row.unit !== 1 && row.unit !== 2) || !Number.isInteger(row.outlet) || row.outlet < 1 || row.outlet > 8 ||
+      typeof row.label !== "string" || typeof row.server !== "string" || !Number.isInteger(row.sortOrder) ||
+      typeof row.updatedAt !== "string" || !Number.isFinite(Date.parse(row.updatedAt))) {
+    throw new SharedLabelsUnavailable();
+  }
+  return { unit: row.unit, outlet: row.outlet, label: row.label, server: row.server, sortOrder: row.sortOrder, updatedAt: row.updatedAt };
+}
+
+async function sharedRows(config: { url: string; token: string }) {
+  const result = await sharedRequest(config, "/v1/labels") as { labels?: unknown[] } | null;
+  if (!result || !Array.isArray(result.labels)) throw new SharedLabelsUnavailable();
+  const rows = result.labels.map(parseSharedRow);
+  if (new Set(rows.map((row) => `${row.unit}:${row.outlet}`)).size !== rows.length) throw new SharedLabelsUnavailable();
+  return rows;
+}
+
+function cacheRows(rows: OutletRecord[], unit: UnitId) {
+  initDb(unit);
+  sqlite(`BEGIN; ${rows.map((row) => `
+    insert into ${tableName(unit)} (outlet,label,server,sort_order,updated_at)
+    values (${row.outlet},${sqlString(row.label)},${sqlString(row.server)},${row.sortOrder},${sqlString(row.updatedAt)})
+    on conflict(outlet) do update set label=excluded.label,server=excluded.server,
+      sort_order=excluded.sort_order,updated_at=excluded.updated_at;
+  `).join("\n")} COMMIT;`);
+}
+
+async function seedRows(config: { url: string; token: string }, rows: OutletRecord[]) {
+  // Eight Unicode labels can exceed 4 KiB. Bound every seed request by bytes.
+  let batch: OutletRecord[] = [];
+  for (const row of rows) {
+    const seed = { ...row, updatedAt: row.updatedAt.includes("T") ? row.updatedAt : row.updatedAt.replace(" ", "T") + "Z" };
+    if (Buffer.byteLength(JSON.stringify({ labels: [...batch, seed] })) > 4096 && batch.length) {
+      await sharedRequest(config, "/v1/labels/seed", { labels: batch });
+      batch = [];
+    }
+    batch.push(seed);
+  }
+  if (batch.length) await sharedRequest(config, "/v1/labels/seed", { labels: batch });
+}
+
+export async function getOutletRecords(unit: UnitId = 1): Promise<OutletRecord[]> {
+  const local = localOutletRecords(unit);
+  const config = sharedConfig();
+  if (!config) return local;
+  try {
+    let rows = (await sharedRows(config)).filter((row) => row.unit === unit);
+    const key = `${config.url}:${unit}`;
+    // Every replica offers its original snapshot once, including when another
+    // replica seeded first. Only newer seed timestamps may replace seed rows.
+    if (!seededUnits.has(key) || rows.length < 8) {
+      await seedRows(config, local);
+      rows = (await sharedRows(config)).filter((row) => row.unit === unit);
+      seededUnits.add(key);
+    }
+    if (rows.length !== 8) throw new SharedLabelsUnavailable();
+    rows.sort((a, b) => a.sortOrder - b.sortOrder || a.outlet - b.outlet);
+    cacheRows(rows, unit);
+    return rows;
+  } catch {
+    return local.map((row) => ({ ...row, readOnly: true }));
+  }
+}
+
+export async function updateOutlet(outlet: number, label: string, server: string, unit: UnitId = 1) {
+  tableName(unit);
+  if (!Number.isInteger(outlet) || outlet < 1 || outlet > 8) throw new Error("Invalid outlet.");
+  const config = sharedConfig();
+  if (config) {
+    if ([label, server].some((value) => !value.trim() || [...value.trim()].length > 64 || /\p{Cc}/u.test(value))) {
+      throw new Error("Label and server must have 1..64 characters without control characters.");
+    }
+    let row: OutletRecord;
+    try {
+      row = parseSharedRow(await sharedRequest(config, `/v1/labels/${unit}/${outlet}`,
+        { label: label.trim(), server: server.trim() }, "PUT"));
+      if (row.unit !== unit || row.outlet !== outlet) throw new SharedLabelsUnavailable();
+    } catch {
+      throw new SharedLabelsUnavailable();
+    }
+    cacheRows([row], unit);
+    return row;
+  }
   initDb(unit);
 
   sqlite(`
@@ -105,5 +221,5 @@ export function updateOutlet(outlet: number, label: string, server: string, unit
     where outlet = ${outlet};
   `);
 
-  return getOutletRecords(unit).find((record) => record.outlet === outlet) ?? null;
+  return localOutletRecords(unit).find((record) => record.outlet === outlet) ?? null;
 }

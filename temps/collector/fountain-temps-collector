@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from urllib.parse import parse_qs, urlsplit
 
 HOST_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
@@ -60,6 +61,64 @@ def sql_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError("invalid number")
     return str(value)
+
+
+def validate_label(unit, outlet, payload, seed=False):
+    if type(unit) is not int or unit not in (1, 2):
+        raise ValueError("unit must be 1 or 2")
+    if type(outlet) is not int or not 1 <= outlet <= 8:
+        raise ValueError("outlet must be 1..8")
+    if not isinstance(payload, dict):
+        raise ValueError("label must be an object")
+    row = dict(unit=unit, outlet=outlet, sortOrder=outlet)
+    for key in ("label", "server"):
+        value = payload.get(key)
+        if not isinstance(value, str) or any(unicodedata.category(c) == "Cc" for c in value):
+            raise ValueError(key + " must not contain control characters")
+        value = value.strip()
+        if not 1 <= len(value) <= 64:
+            raise ValueError(key + " must have 1..64 characters")
+        value.encode("utf-8")
+        row[key] = value
+    if seed:
+        row["updatedAt"] = iso(parse_time(payload.get("updatedAt")))
+        order = payload.get("sortOrder", outlet)
+        if type(order) is not int or not -(2**31) <= order < 2**31:
+            raise ValueError("invalid sortOrder")
+        row["sortOrder"] = order
+    return row
+
+
+LABEL_ROW_SQL = """json_build_object('unit',unit,'outlet',outlet,'label',label,'server',server,
+ 'sortOrder',sort_order,'updatedAt',updated_at)"""
+
+
+def labels_sql():
+    return ("SELECT json_build_object('labels',coalesce(json_agg(" + LABEL_ROW_SQL
+            + " ORDER BY unit,sort_order,outlet),'[]'::json)) FROM fountain.power_outlet_labels;")
+
+
+def label_upsert_sql(rows, seed=False):
+    values = []
+    for row in rows:
+        fields = [str(row["unit"]), str(row["outlet"]), sql_text(row["label"]), sql_text(row["server"]),
+                  str(row["sortOrder"]), sql_text(row["updatedAt"]) + "::timestamptz" if seed else "now()",
+                  "'seed'" if seed else "'put'"]
+        values.append("(" + ",".join(fields) + ")")
+    if not values:
+        return "SELECT json_build_object('inserted',0,'updated',0,'ignored',0);"
+    conflict = ("label=excluded.label,server=excluded.server,updated_at=excluded.updated_at,"
+                "updated_by=excluded.updated_by")
+    if seed:
+        conflict += (",sort_order=excluded.sort_order WHERE excluded.updated_at > power_outlet_labels.updated_at "
+                     "AND power_outlet_labels.updated_by = 'seed'")
+    statement = ("INSERT INTO fountain.power_outlet_labels (unit,outlet,label,server,sort_order,updated_at,updated_by) VALUES "
+                 + ",".join(values) + " ON CONFLICT (unit,outlet) DO UPDATE SET " + conflict)
+    if seed:
+        return ("WITH changed AS (" + statement + " RETURNING (xmax=0) AS inserted) SELECT "
+                "json_build_object('inserted',count(*) FILTER (WHERE inserted),'updated',count(*) FILTER (WHERE NOT inserted),"
+                f"'ignored',{len(rows)}-count(*)) FROM changed;")
+    return statement + " RETURNING " + LABEL_ROW_SQL + ";"
 
 
 def sweep_sql(samples, sweep_at, retention_days=None):
@@ -125,9 +184,9 @@ SELECT json_build_object('from',{sql_text(start)},'to',{sql_text(end)},'bucket_s
 
 
 class Database:
-    def run(self, sql, write=False):
-        role = "fountain_temps_writer" if write else "fountain_temps_reader"
-        command = ["docker", "exec", "-i", "coolify-db", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", role,
+    def run(self, sql, write=False, role=None):
+        role = role or ("fountain_temps_writer" if write else "fountain_temps_reader")
+        command = ["docker", "exec", "-i", "coolify-db", "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", role,
                    "-d", "coolify", "-At"]
         command += ["-f", "-"] if write else ["-c", sql]
         result = subprocess.run(command, input=sql if write else None, capture_output=True, text=True,
@@ -143,12 +202,41 @@ class Database:
     def history(self, start, end, host, bucket):
         return self.run(history_sql(start, end, host, bucket))
 
+    def labels(self):
+        return self.run(labels_sql(), role="fountain_power_labels")
+
+    def save_labels(self, rows, seed=False):
+        return self.run(label_upsert_sql(rows, seed), role="fountain_power_labels")
+
 
 class MemoryDatabase:
     """Only selected by --dry-run. No Docker, database, or remote connections."""
     def __init__(self):
         self.samples = []
+        self.label_rows = {}
         self.lock = threading.Lock()
+
+    def labels(self):
+        with self.lock:
+            return {"labels": [dict(row) for row, _ in sorted(self.label_rows.values(),
+                              key=lambda item: (item[0]["unit"], item[0]["sortOrder"], item[0]["outlet"]))]}
+
+    def save_labels(self, rows, seed=False):
+        counts = dict(inserted=0, updated=0, ignored=0)
+        with self.lock:
+            for row in rows:
+                key = (row["unit"], row["outlet"])
+                previous = self.label_rows.get(key)
+                if seed and previous and (previous[1] != "seed" or
+                        parse_time(row["updatedAt"]) <= parse_time(previous[0]["updatedAt"])):
+                    counts["ignored"] += 1
+                    continue
+                counts["updated" if previous else "inserted"] += 1
+                saved = dict(row, updatedAt=row["updatedAt"] if seed else iso(dt.datetime.now(UTC)))
+                if previous and not seed:
+                    saved["sortOrder"] = previous[0]["sortOrder"]
+                self.label_rows[key] = (saved, "seed" if seed else "put")
+            return counts if seed else dict(saved)
 
     def store(self, samples, sweep_at, retention_days):
         with self.lock:
@@ -259,6 +347,7 @@ def load_config(path, dry_run):
     config.setdefault("retention_days", 180)
     config.setdefault("key_path", "/etc/fountain-temps/id_ed25519")
     config.setdefault("api_token_file", "/etc/fountain-temps/api-token")
+    config.setdefault("labels_token_file", "/etc/fountain-temps/labels-token")
     if type(config["interval"]) is not int or not 1 <= config["interval"] <= 86400:
         raise ValueError("invalid interval")
     if type(config["retention_days"]) is not int or not 1 <= config["retention_days"] <= 3650:
@@ -282,18 +371,28 @@ def load_config(path, dry_run):
                 raise ValueError("invalid SSH port")
             if host.get("jump") and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:,\[\]-]{0,255}", host["jump"]):
                 raise ValueError("invalid jump target")
-    token_path = Path(config["api_token_file"])
+    token = read_token(config["api_token_file"])
+    labels_path = Path(config["labels_token_file"])
+    config["labels_token"] = read_token(labels_path) if labels_path.exists() else None
+    if config["labels_token"] == token:
+        raise ValueError("labels token must differ from temperature token")
+    return config, token
+
+
+def read_token(path):
+    token_path = Path(path)
     if stat.S_IMODE(token_path.stat().st_mode) != 0o600:
         raise ValueError("api token file must have mode 0600")
     token = token_path.read_text().strip()
     if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
         raise ValueError("api token must be at least 32 ASCII characters without whitespace")
-    return config, token
+    return token
 
 
 class Collector:
     def __init__(self, config, token, database, dry_run=False):
         self.config, self.token, self.database, self.dry_run = config, token, database, dry_run
+        self.labels_token = config.get("labels_token")
         self.last_sweep_at = None
         self.last_retention_day = None
         self.stop = threading.Event()
@@ -338,6 +437,9 @@ def handler_for(collector):
             self.reply(code, {"error": "Invalid HTTP request"})
 
         def reply(self, status, payload):
+            # Error responses may leave a request body unread; never reuse that connection.
+            if status >= 400:
+                self.close_connection = True
             body = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -350,8 +452,13 @@ def handler_for(collector):
         def authorized(self, path):
             if path == "/health":
                 return True
+            is_labels = path == "/v1/labels" or path.startswith("/v1/labels/")
+            token = collector.labels_token if is_labels else collector.token
+            if not token:
+                self.reply(503, {"error": "Label service not configured"})
+                return False
             actual = self.headers.get("Authorization", "").encode("utf-8")
-            expected = ("Bearer " + collector.token).encode("utf-8")
+            expected = ("Bearer " + token).encode("utf-8")
             if not hmac.compare_digest(actual, expected):
                 self.reply(401, {"error": "Unauthorized"})
                 return False
@@ -366,6 +473,8 @@ def handler_for(collector):
                     self.reply(200, dict(ok=True, last_sweep_at=collector.last_sweep_at, hosts=len(collector.config["hosts"])))
                 elif url.path == "/v1/latest":
                     self.reply(200, collector.database.latest())
+                elif url.path == "/v1/labels":
+                    self.reply(200, collector.database.labels())
                 elif url.path == "/v1/history":
                     try:
                         hours, host, bucket = history_params(parse_qs(url.query, keep_blank_values=True, max_num_fields=16))
@@ -377,13 +486,61 @@ def handler_for(collector):
                 else:
                     self.reply(404, {"error": "Not found"})
             except Exception:
-                self.reply(503, {"error": "Temperature storage unavailable"})
+                self.reply(503, {"error": "Shared label storage unavailable" if url.path.startswith("/v1/labels")
+                                        else "Temperature storage unavailable"})
+
+        def label_write(self, seed):
+            path = urlsplit(self.path).path
+            if not self.authorized(path):
+                return
+            match = re.fullmatch(r"/v1/labels/([^/]+)/([^/]+)", path)
+            if (seed and path != "/v1/labels/seed") or (not seed and not match):
+                self.reply(405, {"error": "Method not allowed"})
+                return
+            try:
+                if self.headers.get("Transfer-Encoding"):
+                    raise ValueError("Transfer-Encoding is not supported")
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+                    raise ValueError("Content-Length required")
+                length = int(lengths[0])
+                if length > 4096:
+                    self.reply(413, {"error": "Label body exceeds 4 KiB"})
+                    return
+                payload = json.loads(self.rfile.read(length))
+                if seed:
+                    rows = payload.get("labels") if isinstance(payload, dict) else None
+                    if not isinstance(rows, list) or len(rows) > 16:
+                        raise ValueError("labels must be an array of at most 16 rows")
+                    clean = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            raise ValueError("seed rows must be objects")
+                        clean.append(validate_label(row.get("unit"), row.get("outlet"), row, seed=True))
+                    rows = clean
+                    if len({(r["unit"], r["outlet"]) for r in rows}) != len(rows):
+                        raise ValueError("duplicate seed outlet")
+                else:
+                    rows = [validate_label(int(match[1]), int(match[2]), payload)]
+            except (ValueError, TypeError, OverflowError):
+                self.reply(400, {"error": "Invalid label payload: unit 1|2, outlet 1..8, label/server 1..64 characters without controls; seeds need updatedAt with timezone"})
+                return
+            try:
+                self.reply(200, collector.database.save_labels(rows, seed))
+            except Exception:
+                self.reply(503, {"error": "Shared label storage unavailable"})
+
+        def do_PUT(self):
+            self.label_write(False)
+
+        def do_POST(self):
+            self.label_write(True)
 
         def unsupported(self):
             if self.authorized(urlsplit(self.path).path):
                 self.reply(405, {"error": "Method not allowed"})
 
-        do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = unsupported
+        do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = unsupported
 
     return Handler
 

@@ -326,7 +326,7 @@ export async function readPowerStates(unit: UnitId = 1) {
 
 export async function getOutletsWithState(): Promise<OutletView[]> {
   return (await Promise.all(UNITS.map(async ({ id }) => {
-    const records = getOutletRecords(id);
+    const records = await getOutletRecords(id);
     const states = await readPowerStates(id);
     const protectedOutlets = id === 1 ? protectedOffOutlets() : new Set<number>();
     return records.map((record) => ({

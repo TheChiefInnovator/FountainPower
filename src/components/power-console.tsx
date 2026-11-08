@@ -28,6 +28,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
   const [isRefreshing, startRefresh] = useTransition();
 
   const onlineCount = outlets.filter((outlet) => outlet.state === "on" && !outlet.inputDisconnected).length;
+  const labelsReadOnly = outlets.some((outlet) => outlet.readOnly);
   const sessionExpires = useSyncExternalStore(
     subscribeToLocale,
     () => new Intl.DateTimeFormat(undefined, {
@@ -93,6 +94,9 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
       const data = (await response.json()) as { outlet?: OutletView; error?: string };
 
       if (!response.ok || !data.outlet) {
+        if (response.status === 503) {
+          setOutlets((current) => current.map((outlet) => ({ ...outlet, readOnly: true })));
+        }
         throw new Error(data.error ?? "Could not save outlet.");
       }
 
@@ -159,6 +163,12 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
           <div className="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
             {error}
           </div>
+        ) : null}
+
+        {labelsReadOnly ? (
+          <p role="status" className="mt-3 text-xs text-amber-200">
+            labels read-only: shared store unavailable
+          </p>
         ) : null}
 
         {UNITS.map((unit) => <section key={unit.id} aria-label={unit.label} className="mt-4 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--panel)]">
@@ -255,7 +265,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                         <IconButton label="Cancel" onClick={() => setEditing(null)} disabled={isPending}>
                           <X className="h-4 w-4" />
                         </IconButton>
-                        <IconButton label="Save" onClick={saveEdit} disabled={isPending}>
+                        <IconButton label="Save" onClick={saveEdit} disabled={isPending || labelsReadOnly}>
                           {isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                         </IconButton>
                       </>
@@ -278,7 +288,7 @@ export function PowerConsole({ initialOutlets, sessionExpiresAt }: PowerConsoleP
                               server: outlet.server,
                             })
                           }
-                          disabled={isPending}
+                          disabled={isPending || labelsReadOnly}
                         >
                           <Edit3 className="h-4 w-4" />
                         </IconButton>
