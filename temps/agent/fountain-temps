@@ -14,6 +14,34 @@ import subprocess
 import sys
 import time
 
+# Resource probes stay inside a small, fixed budget: one short CPU delta, one
+# meminfo/vm_stat read and statvfs per local mount. No metric is ever reported
+# as zero when it is actually unavailable: unavailable metrics are null.
+CPU_SAMPLE_SECONDS = 0.25
+MOUNT_MAX = 32
+TEXT_MAX = 255
+# Only real local filesystems are reported. Pseudo filesystems (proc, sysfs,
+# tmpfs, overlay, cgroup, devtmpfs...) and network filesystems (nfs, cifs,
+# sshfs, smb3...) are deliberately absent so they can never be counted as disk.
+REAL_FILESYSTEMS = frozenset((
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "bcachefs", "zfs",
+    "vfat", "msdos", "exfat", "ntfs", "ntfs3", "jfs", "reiserfs", "ufs",
+    "hfs", "hfsplus", "apfs",
+))
+# Pseudo/duplicate mount trees that share a real device or have no capacity.
+SKIP_MOUNT_PREFIXES = (
+    "/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker",
+    "/var/lib/containers", "/System/Volumes", "/Library/Developer/CoreSimulator",
+)
+SWAP_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
+              "T": 1024 ** 4, "P": 1024 ** 5}
+VM_STAT_PAGE = re.compile(r"page size of (\d+) bytes")
+VM_STAT_LINE = re.compile(r'^(?:"(?P<quoted>[^"]+)"|(?P<plain>[^:]+)):\s+(?P<count>\d+)\.?\s*$')
+MOUNT_LINE = re.compile(r"^(\S+)\s+on\s+(.*?)\s+\(([^)]*)\)$")
+MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
+TOP_CPU_LINE = re.compile(r"CPU usage:\s*([\d.]+)%\s*user,\s*([\d.]+)%\s*sys,\s*([\d.]+)%\s*idle")
+SWAP_LINE = re.compile(r"total\s*=\s*([\d.]+)\s*([A-Za-z]?)\s+used\s*=\s*([\d.]+)\s*([A-Za-z]?)")
+
 
 def read(path):
     try:
@@ -140,6 +168,314 @@ def virtualized(root=Path("/sys")):
                 or (root / "hypervisor/type").exists())
 
 
+# --- Resource probes (CPU, memory, local disks) ------------------------------
+
+def parse_proc_stat(text):
+    """Return (total_jiffies, idle_jiffies) from the aggregate `/proc/stat` cpu line.
+
+    The eight fields user..steal are mutually exclusive. `guest` and `guest_nice`
+    are already counted inside `user` and `nice`, so summing every field would
+    double count them.
+    """
+    for line in text.splitlines():
+        if not line.startswith("cpu "):
+            continue
+        fields = line.split()[1:]
+        try:
+            values = [int(field) for field in fields]
+        except ValueError:
+            return None
+        if len(values) < 4:
+            return None
+        # idle + iowait are the non-busy states; steal is charged as busy.
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values[:8]), idle
+    return None
+
+
+def cpu_usage(previous, current):
+    """Interval utilization between two /proc/stat samples, clamped to 0..100."""
+    if previous is None or current is None:
+        return None
+    total = current[0] - previous[0]
+    idle = current[1] - previous[1]
+    if total <= 0 or idle < 0:
+        return None
+    return round(min(100.0, max(0.0, (total - idle) / total * 100)), 1)
+
+
+def linux_cpu(stat_path=Path("/proc/stat"), sleep=time.sleep, seconds=CPU_SAMPLE_SECONDS):
+    first = parse_proc_stat(read(stat_path))
+    sleep(seconds)
+    second = parse_proc_stat(read(stat_path))
+    usage = cpu_usage(first, second)
+    if usage is None:
+        return None
+    try:
+        cores = os.cpu_count()
+    except (NotImplementedError, OSError):
+        cores = None
+    return dict(usage_percent=usage, cores=cores, window_s=seconds)
+
+
+def meminfo_values(text):
+    values = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if not parts:
+            continue
+        try:
+            values[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+    return values
+
+
+def memory_from_meminfo(text):
+    """Total/used/available bytes; used = MemTotal - MemAvailable (kB values)."""
+    values = meminfo_values(text)
+    total = values.get("MemTotal")
+    if not total or total <= 0:
+        return None
+    available = values.get("MemAvailable")
+    if available is None:
+        free = values.get("MemFree")
+        if free is None:
+            return None
+        available = free + values.get("Buffers", 0) + values.get("Cached", 0)
+    total_bytes = total * 1024
+    available_bytes = min(total_bytes, max(0, available) * 1024)
+    memory = dict(total_bytes=total_bytes, used_bytes=total_bytes - available_bytes,
+                  available_bytes=available_bytes, swap_total_bytes=None, swap_used_bytes=None)
+    swap_total = values.get("SwapTotal")
+    if swap_total is not None and swap_total >= 0:
+        memory["swap_total_bytes"] = swap_total * 1024
+        swap_free = values.get("SwapFree")
+        if swap_free is not None and 0 <= swap_free <= swap_total:
+            memory["swap_used_bytes"] = (swap_total - swap_free) * 1024
+    return memory
+
+
+def unescape_mount(value):
+    """Decode the octal escapes /proc/self/mounts uses for space, tab, newline and backslash."""
+    return MOUNT_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
+
+
+def parse_mounts(text):
+    """Real local filesystems from /proc/self/mounts, deduplicated by mount and device."""
+    result, seen_mounts, seen_devices = [], set(), set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        # /proc/self/mounts escapes space, tab, newline and backslash as octals
+        # (\040 etc); statvfs needs the real path, so decode before using it.
+        device, mount, fstype = unescape_mount(parts[0]), unescape_mount(parts[1]), parts[2]
+        if fstype not in REAL_FILESYSTEMS or not mount.startswith("/"):
+            continue
+        if device.startswith("/dev/loop"):
+            continue
+        if any(mount == prefix or mount.startswith(prefix + "/") for prefix in SKIP_MOUNT_PREFIXES):
+            continue
+        if mount in seen_mounts or device in seen_devices:
+            continue
+        result.append((device, mount, fstype))
+        seen_mounts.add(mount)
+        seen_devices.add(device)
+    # Shortest path first so "/" wins when a device is bind-mounted repeatedly.
+    return sorted(result, key=lambda item: (len(item[1]), item[1]))
+
+
+def parse_mac_mounts(text):
+    """`mount` output lines that are local and on an allowed real filesystem."""
+    result, seen_mounts, seen_devices = [], set(), set()
+    for line in text.splitlines():
+        match = MOUNT_LINE.match(line.strip())
+        if not match:
+            continue
+        device, mount, options = match.groups()
+        tokens = [token.strip() for token in options.split(",")]
+        if "local" not in tokens or not mount.startswith("/"):
+            continue
+        fstype = tokens[0] if tokens and tokens[0] else "unknown"
+        if fstype not in REAL_FILESYSTEMS:
+            continue
+        if any(mount == prefix or mount.startswith(prefix + "/") for prefix in SKIP_MOUNT_PREFIXES):
+            continue
+        if mount in seen_mounts or device in seen_devices:
+            continue
+        result.append((device, mount, fstype))
+        seen_mounts.add(mount)
+        seen_devices.add(device)
+    return sorted(result, key=lambda item: (len(item[1]), item[1]))
+
+
+def disk_readings(mounts, statvfs=os.statvfs, max_mounts=MOUNT_MAX):
+    """statvfs capacity per mount; unreadable mounts are skipped, never zeroed."""
+    disks = []
+    seen_mounts, seen_devices = set(), set()
+    for device, mount, fstype in mounts:
+        if mount in seen_mounts or device in seen_devices:
+            continue
+        try:
+            stats = statvfs(mount)
+        except OSError:
+            continue
+        block = getattr(stats, "f_frsize", 0) or getattr(stats, "f_bsize", 0)
+        if not block:
+            continue
+        total = block * stats.f_blocks
+        free = block * stats.f_bfree
+        available = block * stats.f_bavail
+        if total <= 0:
+            continue
+        available = min(total, max(0, available))
+        used = min(total, max(0, total - free))
+        if used + available > total:
+            used = total - available
+        # Identity (mount/device) dedupe happens above. Two independent disks can
+        # share an identical capacity triple, so capacity is never used to dedupe.
+        disks.append(dict(mount=mount[:TEXT_MAX], device=device[:TEXT_MAX], fstype=fstype[:TEXT_MAX],
+                          total_bytes=total, used_bytes=used, available_bytes=available))
+        seen_mounts.add(mount)
+        seen_devices.add(device)
+        if len(disks) >= max_mounts:
+            break
+    return disks
+
+
+def linux_resources(root=Path("/proc")):
+    disks = disk_readings(parse_mounts(read(root / "self/mounts")))
+    return dict(cpu=linux_cpu(), memory=memory_from_meminfo(read(root / "meminfo")), disks=disks)
+
+
+def parse_top_cpu(text):
+    """Last `CPU usage:` sample from `top -l 2`, as user+sys percent."""
+    usage = None
+    for line in text.splitlines():
+        match = TOP_CPU_LINE.search(line)
+        if match:
+            usage = float(match.group(1)) + float(match.group(2))
+    return None if usage is None else round(min(100.0, max(0.0, usage)), 1)
+
+
+def parse_ps_cpu(text, cores):
+    total, found = 0.0, False
+    for line in text.splitlines():
+        value = number(line.strip())
+        if value is not None and value >= 0:
+            total += value
+            found = True
+    if not found:
+        return None
+    return round(min(100.0, total / (cores or 1)), 1)
+
+
+def swap_from_swapusage(text):
+    match = SWAP_LINE.search(text)
+    if not match:
+        return None, None
+    total = float(match.group(1)) * SWAP_UNITS.get(match.group(2).upper(), 1)
+    used = float(match.group(3)) * SWAP_UNITS.get(match.group(4).upper(), 1)
+    used = min(total, max(0.0, used))
+    return int(total), int(used)
+
+
+def parse_vm_stat(text):
+    """Return (page_size, {page category: count}) from `vm_stat`."""
+    page_size = 4096
+    header = VM_STAT_PAGE.search(text)
+    if header:
+        page_size = int(header.group(1))
+    pages = {}
+    for line in text.splitlines():
+        match = VM_STAT_LINE.match(line.strip())
+        if match:
+            pages[(match.group("quoted") or match.group("plain")).strip().lower()] = int(match.group("count"))
+    return page_size, pages
+
+
+def memory_from_vm_stat(text, total_bytes, swap=(None, None)):
+    """Total/used/available bytes; available = free + speculative + inactive pages."""
+    if not total_bytes or total_bytes <= 0:
+        return None
+    page_size, pages = parse_vm_stat(text)
+    if not pages:
+        return None
+    available = sum(pages.get(key, 0) for key in ("pages free", "pages speculative", "pages inactive")) * page_size
+    available_bytes = min(total_bytes, max(0, available))
+    return dict(total_bytes=total_bytes, used_bytes=total_bytes - available_bytes,
+                available_bytes=available_bytes, swap_total_bytes=swap[0], swap_used_bytes=swap[1])
+
+
+def mac_memory_total():
+    try:
+        completed = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                                   timeout=1, check=False)
+        return int(completed.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def mac_cpu():
+    try:
+        completed = subprocess.run(["sysctl", "-n", "hw.logicalcpu"], capture_output=True, text=True,
+                                   timeout=1, check=False)
+        cores = int(completed.stdout.strip()) if completed.stdout.strip().isdigit() else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        cores = None
+    top = shutil.which("top") or "/usr/bin/top"
+    try:
+        completed = subprocess.run([top, "-l", "2", "-n", "0", "-s", "1"], capture_output=True, text=True,
+                                   timeout=4, check=False)
+        usage = parse_top_cpu(completed.stdout)
+        if usage is not None:
+            return dict(usage_percent=usage, cores=cores, window_s=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    ps = shutil.which("ps") or "/bin/ps"
+    try:
+        completed = subprocess.run([ps, "-A", "-o", "%cpu="], capture_output=True, text=True, timeout=3, check=False)
+        usage = parse_ps_cpu(completed.stdout, cores)
+        if usage is not None:
+            # ps reports a since-start decay average, not an interval: no window.
+            return dict(usage_percent=usage, cores=cores, window_s=None)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def mac_disks():
+    mount = shutil.which("mount") or "/sbin/mount"
+    try:
+        completed = subprocess.run([mount], capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return disk_readings(parse_mac_mounts(completed.stdout))
+
+
+def mac_resources():
+    warnings = []
+    cpu = mac_cpu()
+    if cpu is None:
+        warnings.append("CPU usage unavailable")
+    total = mac_memory_total()
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        vm = ""
+    try:
+        swap = swap_from_swapusage(subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True,
+                                                  text=True, timeout=1, check=False).stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        swap = (None, None)
+    memory = memory_from_vm_stat(vm, total, swap)
+    if memory is None:
+        warnings.append("memory usage unavailable")
+    return dict(cpu=cpu, memory=memory, disks=mac_disks()), warnings
+
+
 def collect():
     warnings = []
     uptime = None
@@ -153,11 +489,14 @@ def collect():
         except (OSError, subprocess.TimeoutExpired):
             warnings.append("uptime unavailable")
         vm = False
+        resources, resource_warnings = mac_resources()
+        warnings.extend(resource_warnings)
     else:
         readings = linux_readings()
         raw_uptime = read(Path("/proc/uptime")).split()
         uptime = int(float(raw_uptime[0])) if raw_uptime else None
         vm = virtualized()
+        resources = linux_resources()
         nvidia = shutil.which("nvidia-smi")
         if nvidia:
             try:
@@ -174,7 +513,8 @@ def collect():
         load = None
     return dict(schema=1, hostname=socket.gethostname(),
                 collected_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-                virtualized=vm, readings=readings, warnings=warnings, uptime_s=uptime, load1=load)
+                virtualized=vm, readings=readings, resources=resources, warnings=warnings,
+                uptime_s=uptime, load1=load)
 
 
 if __name__ == "__main__":
@@ -183,5 +523,5 @@ if __name__ == "__main__":
         payload = collect()
     except Exception:
         payload = dict(schema=1, hostname=socket.gethostname(), collected_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                       virtualized=False, readings=[], warnings=["temperature probe failed"], uptime_s=None, load1=None)
+                       virtualized=False, readings=[], resources=None, warnings=["temperature probe failed"], uptime_s=None, load1=None)
     print(json.dumps(payload, allow_nan=False, separators=(",", ":")))

@@ -71,6 +71,8 @@ for the schema and separate token setup.
 
 The authenticated `/power/temperatures` dashboard shows fleet temperatures and up to 30 days of history. It refreshes every 60 seconds through the session-protected `/power/api/temperatures` proxy. The collector samples every five minutes and retains 180 days; it uses dedicated PostgreSQL roles inside `coolify-db`, without exposing PostgreSQL on the LAN. See [temperature installation and rollback](temps/install.md) for the agent, SSH restrictions, schema, collector configuration, and local dry-run commands.
 
+The same five-minute sweep records CPU utilization, memory (and swap) usage and per-filesystem disk capacity, so the dashboard also shows a resource overview, per-host resource details and chartable CPU/memory/disk percentage history. CPU is a short-interval usage sample, not load average. Metrics a host cannot report stay empty rather than zero, and the temperature-only view is unchanged for collectors that predate resource collection. Apply `temps/sql/003_fountain_host_resources.sql` before deploying the updated collector.
+
 ## Power Drivers
 
 Use `POWER_CONTROL_DRIVER=telnet` for redundant deployments. The Telnet driver talks to the WTI network text interface and uses the same commands as the serial driver:

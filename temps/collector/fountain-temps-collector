@@ -19,6 +19,11 @@ from urllib.parse import parse_qs, urlsplit
 
 HOST_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 KINDS = {"cpu", "gpu", "nvme", "memory", "board", "network", "other"}
+METRICS = ("temp", "cpu", "memory", "disk")
+BYTE_MAX = 2 ** 63
+MOUNT_MAX = 32
+TEXT_MAX = 255
+TOTAL_SLACK = 65536
 UTC = dt.timezone.utc
 
 
@@ -46,6 +51,13 @@ def history_params(query):
     if query.get("bucket", ["auto"])[0] != "auto":
         raise ValueError("bucket must be auto")
     return hours, host, 300 if hours <= 24 else 1800 if hours <= 168 else 7200
+
+
+def history_metric(query):
+    metric = query.get("metric", ["temp"])[0]
+    if metric not in METRICS:
+        raise ValueError("invalid metric")
+    return metric
 
 
 def sql_text(value):
@@ -124,31 +136,59 @@ def label_upsert_sql(rows, seed=False):
 def sweep_sql(samples, sweep_at, retention_days=None):
     statements = ["BEGIN;"]
     for index, sample in enumerate(samples):
+        resources = sample.get("resources") or {}
+        cpu = resources.get("cpu") or {}
+        memory = resources.get("memory") or {}
+        disks = resources.get("disks") or []
         values = [sql_text(sweep_at) + "::timestamptz", sql_text(sample.get("collected_at")) + "::timestamptz",
                   sql_text(sample["host"]), sql_text(sample["status"]), sql_text(sample.get("error")),
                   sql_number(sample.get("uptime_s")), sql_number(sample.get("load1")), str(len(sample["readings"])),
-                  sql_text(json.dumps(sample.get("warnings", []))) + "::jsonb"]
+                  sql_text(json.dumps(sample.get("warnings", []))) + "::jsonb",
+                  sql_number(cpu.get("usage_percent")), sql_number(cpu.get("cores")), sql_number(cpu.get("window_s")),
+                  sql_number(memory.get("total_bytes")), sql_number(memory.get("used_bytes")),
+                  sql_number(memory.get("available_bytes")), sql_number(memory.get("swap_total_bytes")),
+                  sql_number(memory.get("swap_used_bytes"))]
         insert = ("INSERT INTO fountain.host_temperature_samples "
-                  "(sweep_at,collected_at,host,status,error,uptime_s,load1,readings_count,warnings) VALUES ("
+                  "(sweep_at,collected_at,host,status,error,uptime_s,load1,readings_count,warnings,"
+                  "cpu_percent,cpu_cores,cpu_window_s,memory_total_bytes,memory_used_bytes,memory_available_bytes,"
+                  "swap_total_bytes,swap_used_bytes) VALUES ("
                   + ",".join(values) + ") RETURNING id")
-        if not sample["readings"]:
+        ctes = []
+        if sample["readings"]:
+            rows = []
+            for sensor in sample["readings"]:
+                fields = [sql_text(sample["host"]), sql_text(sweep_at) + "::timestamptz"]
+                fields += [sql_text(sensor[key]) for key in ("kind", "chip", "device", "label")]
+                fields += [sql_number(sensor.get(key)) + "::real" for key in ("celsius", "max", "crit")]
+                rows.append("(" + ",".join(fields) + ")")
+            ctes.append(f"readings{index} AS (INSERT INTO fountain.host_temperature_readings "
+                        "(sample_id,host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c) "
+                        f"SELECT sample{index}.id,v.* FROM sample{index} CROSS JOIN (VALUES "
+                        + ",".join(rows) + ") AS v(host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c))")
+        if disks:
+            rows = []
+            for disk in disks:
+                fields = [sql_text(sample["host"]), sql_text(sweep_at) + "::timestamptz"]
+                fields += [sql_text(disk[key]) for key in ("mount", "device", "fstype")]
+                fields += [sql_number(disk.get(key)) + "::bigint" for key in ("total_bytes", "used_bytes", "available_bytes")]
+                rows.append("(" + ",".join(fields) + ")")
+            ctes.append(f"disks{index} AS (INSERT INTO fountain.host_disk_samples "
+                        "(sample_id,host,sweep_at,mount,device,fstype,total_bytes,used_bytes,available_bytes) "
+                        f"SELECT sample{index}.id,v.* FROM sample{index} CROSS JOIN (VALUES "
+                        + ",".join(rows) + ") AS v(host,sweep_at,mount,device,fstype,total_bytes,used_bytes,available_bytes))")
+        if ctes:
+            statements.append(f"WITH sample{index} AS ({insert}), " + ", ".join(ctes) + " SELECT 1;")
+        else:
             statements.append(insert + ";")
-            continue
-        rows = []
-        for sensor in sample["readings"]:
-            fields = [sql_text(sample["host"]), sql_text(sweep_at) + "::timestamptz"]
-            fields += [sql_text(sensor[key]) for key in ("kind", "chip", "device", "label")]
-            fields += [sql_number(sensor.get(key)) + "::real" for key in ("celsius", "max", "crit")]
-            rows.append("(" + ",".join(fields) + ")")
-        statements.append(f"WITH sample{index} AS ({insert}) INSERT INTO fountain.host_temperature_readings "
-                          "(sample_id,host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c) "
-                          f"SELECT sample{index}.id,v.* FROM sample{index} CROSS JOIN (VALUES "
-                          + ",".join(rows) + ") AS v(host,sweep_at,kind,chip,device,label,celsius,max_c,crit_c);")
     if retention_days is not None:
         statements.append("DELETE FROM fountain.host_temperature_samples WHERE sweep_at < now() - "
                           f"{int(retention_days)} * interval '1 day';")
     statements.append("COMMIT;")
     return "\n".join(statements)
+
+
+DISK_JSON = """json_build_object('mount',mount,'device',device,'fstype',fstype,'total_bytes',total_bytes,
+ 'used_bytes',used_bytes,'available_bytes',available_bytes)"""
 
 
 def latest_sql():
@@ -163,7 +203,16 @@ SELECT json_build_object('sweep_at',(SELECT max(sweep_at) FROM latest),'hosts',c
  'max_celsius',(SELECT max(celsius) FROM fountain.host_temperature_readings WHERE sample_id=s.id),
  'readings',coalesce((SELECT json_agg(json_build_object('kind',kind,'chip',chip,'device',device,'label',label,
  'celsius',celsius,'max',max_c,'crit',crit_c) ORDER BY kind,device,label)
- FROM fountain.host_temperature_readings WHERE sample_id=s.id),'[]'::json)) ORDER BY s.host),'[]'::json))
+ FROM fountain.host_temperature_readings WHERE sample_id=s.id),'[]'::json),
+ 'resources',json_build_object(
+  'cpu',CASE WHEN s.cpu_percent IS NULL THEN NULL ELSE json_build_object('usage_percent',s.cpu_percent,
+   'cores',s.cpu_cores,'window_s',s.cpu_window_s) END,
+  'memory',CASE WHEN s.memory_total_bytes IS NULL THEN NULL ELSE json_build_object('total_bytes',s.memory_total_bytes,
+   'used_bytes',s.memory_used_bytes,'available_bytes',s.memory_available_bytes,
+   'swap_total_bytes',s.swap_total_bytes,'swap_used_bytes',s.swap_used_bytes) END,
+  'disks',coalesce((SELECT json_agg(""" + DISK_JSON + """ ORDER BY mount)
+   FROM fountain.host_disk_samples WHERE sample_id=s.id),'[]'::json)))
+ ORDER BY s.host),'[]'::json))
 FROM latest s LEFT JOIN good g USING(host);
 """
 
@@ -178,9 +227,67 @@ def history_sql(start, end, host, bucket):
 ), series AS (
  SELECT host,kind,json_agg(json_build_array(at,c) ORDER BY at) AS points FROM buckets GROUP BY host,kind
 )
-SELECT json_build_object('from',{sql_text(start)},'to',{sql_text(end)},'bucket_seconds',{bucket},
+SELECT json_build_object('from',{sql_text(start)},'to',{sql_text(end)},'bucket_seconds',{bucket},'metric','temp',
  'series',coalesce(json_agg(row_to_json(series) ORDER BY host,kind),'[]'::json)) FROM series;
 """
+
+
+def resource_history_sql(metric, start, end, host, bucket):
+    """Percentage history for CPU, memory or per-filesystem disk usage.
+
+    Values are bucketed averages so a charted line is a level, not a peak, and
+    percentages are computed from stored byte counts instead of trusting a
+    pre-computed percentage.
+    """
+    restriction = " AND host=" + sql_text(host) if host else ""
+    window = (f"sweep_at >= {sql_text(start)}::timestamptz AND sweep_at <= {sql_text(end)}::timestamptz"
+              + restriction)
+    if metric == "cpu":
+        table, group, value = "fountain.host_temperature_samples", "host", "avg(cpu_percent)"
+        guard = "cpu_percent IS NOT NULL"
+        entries = "json_build_object('host',host,'kind','cpu','points',points)"
+    elif metric == "memory":
+        table, group = "fountain.host_temperature_samples", "host"
+        value = "avg(100.0*memory_used_bytes/NULLIF(memory_total_bytes,0))"
+        guard = "memory_total_bytes IS NOT NULL AND memory_used_bytes IS NOT NULL"
+        entries = "json_build_object('host',host,'kind','memory','points',points)"
+    else:
+        table, group = "fountain.host_disk_samples", "host,mount"
+        value = "avg(100.0*used_bytes/NULLIF(used_bytes+available_bytes,0))"
+        guard = "used_bytes IS NOT NULL AND available_bytes IS NOT NULL"
+        entries = "json_build_object('host',host,'kind','disk','mount',mount,'points',points)"
+    return f"""WITH buckets AS (
+ SELECT {group},to_timestamp(floor(extract(epoch FROM sweep_at)/{bucket})*{bucket}) AS at,{value} AS v
+ FROM {table} WHERE {window} AND {guard}
+ GROUP BY {group},at
+), series AS (
+ SELECT {group},json_agg(json_build_array(at,round(v::numeric,1)) ORDER BY at) AS points FROM buckets GROUP BY {group}
+)
+SELECT json_build_object('from',{sql_text(start)},'to',{sql_text(end)},'bucket_seconds',{bucket},
+ 'metric',{sql_text(metric)},'series',coalesce(json_agg({entries} ORDER BY {group}),'[]'::json)) FROM series;
+"""
+
+
+def bucket_of(sweep_at, bucket):
+    return iso(dt.datetime.fromtimestamp(int(parse_time(sweep_at).timestamp()) // bucket * bucket, UTC))
+
+
+def resource_points(sample, metric):
+    """Yield ((kind, mount|null), percent) resource points for one sample."""
+    resources = sample.get("resources") or {}
+    if metric == "cpu":
+        cpu = resources.get("cpu")
+        if cpu and isinstance(cpu.get("usage_percent"), (int, float)):
+            yield ("cpu", None), float(cpu["usage_percent"])
+    elif metric == "memory":
+        memory = resources.get("memory")
+        if memory and memory.get("total_bytes"):
+            yield ("memory", None), memory["used_bytes"] / memory["total_bytes"] * 100
+    else:
+        for disk in resources.get("disks") or []:
+            denominator = (disk.get("used_bytes") or 0) + (disk.get("available_bytes") or 0)
+            if denominator > 0:
+                yield ("disk", disk["mount"]), disk["used_bytes"] / denominator * 100
 
 
 class Database:
@@ -199,8 +306,12 @@ class Database:
     def latest(self):
         return self.run(latest_sql())
 
-    def history(self, start, end, host, bucket):
-        return self.run(history_sql(start, end, host, bucket))
+    def history(self, start, end, host, bucket, metric="temp"):
+        if metric == "temp":
+            return self.run(history_sql(start, end, host, bucket))
+        if metric not in METRICS:
+            raise ValueError("invalid metric")
+        return self.run(resource_history_sql(metric, start, end, host, bucket))
 
     def labels(self):
         return self.run(labels_sql(), role="fountain_power_labels")
@@ -256,18 +367,113 @@ class MemoryDatabase:
                      for name, sample in sorted(latest.items())]
             return dict(sweep_at=max((s["sweep_at"] for s in hosts), default=None), hosts=hosts)
 
-    def history(self, start, end, host, bucket):
+    def history(self, start, end, host, bucket, metric="temp"):
+        if metric not in METRICS:
+            raise ValueError("invalid metric")
         with self.lock:
-            groups = {}
-            for sample in self.samples:
-                if not parse_time(start) <= parse_time(sample["sweep_at"]) <= parse_time(end) or (host and host != sample["host"]):
-                    continue
-                at = iso(dt.datetime.fromtimestamp(int(parse_time(sample["sweep_at"]).timestamp()) // bucket * bucket, UTC))
-                for sensor in sample["readings"]:
-                    points = groups.setdefault((sample["host"], sensor["kind"]), {})
-                    points[at] = max(points.get(at, -40), sensor["celsius"])
-            return dict(bucket_seconds=bucket, series=[dict(host=h, kind=k, points=sorted(p.items()))
-                        for (h, k), p in sorted(groups.items())], **{"from": start, "to": end})
+            start_at, end_at = parse_time(start), parse_time(end)
+            selected = [sample for sample in self.samples
+                        if start_at <= parse_time(sample["sweep_at"]) <= end_at and (not host or host == sample["host"])]
+            if metric == "temp":
+                groups = {}
+                for sample in selected:
+                    at = bucket_of(sample["sweep_at"], bucket)
+                    for sensor in sample["readings"]:
+                        points = groups.setdefault((sample["host"], sensor["kind"], None), {})
+                        points[at] = max(points.get(at, -40), sensor["celsius"])
+            else:
+                totals = {}
+                for sample in selected:
+                    at = bucket_of(sample["sweep_at"], bucket)
+                    for (kind, mount), value in resource_points(sample, metric):
+                        key = (sample["host"], kind, mount, at)
+                        total, count = totals.get(key, (0.0, 0))
+                        totals[key] = (total + value, count + 1)
+                groups = {}
+                for (name, kind, mount, at), (total, count) in totals.items():
+                    groups.setdefault((name, kind, mount), {})[at] = round(total / count, 1)
+            series = []
+            for (name, kind, mount), points in sorted(groups.items()):
+                entry = dict(host=name, kind=kind, points=sorted(points.items()))
+                if mount is not None:
+                    entry["mount"] = mount
+                series.append(entry)
+            return dict(bucket_seconds=bucket, metric=metric, series=series, **{"from": start, "to": end})
+
+
+def validate_bytes(value, minimum=0, maximum=BYTE_MAX):
+    if type(value) is not int or not minimum <= value < maximum:
+        raise ValueError("invalid byte count")
+    return value
+
+
+def validate_memory(value):
+    if not isinstance(value, dict):
+        raise ValueError("invalid memory")
+    total = validate_bytes(value.get("total_bytes"), minimum=1)
+    used = validate_bytes(value.get("used_bytes"))
+    available = validate_bytes(value.get("available_bytes"))
+    if used > total or available > total or used + available > total + TOTAL_SLACK:
+        raise ValueError("inconsistent memory totals")
+    swap_total, swap_used = value.get("swap_total_bytes"), value.get("swap_used_bytes")
+    if swap_total is None:
+        if swap_used is not None:
+            raise ValueError("swap usage without swap total")
+    else:
+        swap_total = validate_bytes(swap_total)
+        if swap_used is not None:
+            swap_used = validate_bytes(swap_used)
+            if swap_used > swap_total:
+                raise ValueError("inconsistent swap totals")
+    return dict(total_bytes=total, used_bytes=used, available_bytes=available,
+                swap_total_bytes=swap_total, swap_used_bytes=swap_used)
+
+
+def validate_resources(value):
+    """Validate untrusted CPU/memory/disk metrics; null is a missing metric, never zero."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("invalid resources")
+    cpu = value.get("cpu")
+    if cpu is not None:
+        if not isinstance(cpu, dict):
+            raise ValueError("invalid cpu")
+        usage = cpu.get("usage_percent")
+        if usage is None or isinstance(usage, bool) or not isinstance(usage, (int, float)) \
+                or not math.isfinite(usage) or not 0 <= usage <= 100:
+            raise ValueError("invalid cpu usage")
+        cores = cpu.get("cores")
+        if cores is not None and (type(cores) is not int or not 0 < cores <= 4096):
+            raise ValueError("invalid cpu cores")
+        window = cpu.get("window_s")
+        if window is not None and (isinstance(window, bool) or not isinstance(window, (int, float))
+                                   or not math.isfinite(window) or not 0 < window <= 60):
+            raise ValueError("invalid cpu window")
+        cpu = dict(usage_percent=float(usage), cores=cores, window_s=window)
+    memory = value.get("memory")
+    memory = None if memory is None else validate_memory(memory)
+    disks = value.get("disks", [])
+    if not isinstance(disks, list) or len(disks) > MOUNT_MAX:
+        raise ValueError("invalid disks")
+    clean = []
+    for disk in disks:
+        if not isinstance(disk, dict):
+            raise ValueError("invalid disk")
+        text = {}
+        for key in ("mount", "device", "fstype"):
+            item = disk.get(key)
+            if not isinstance(item, str) or not 1 <= len(item) <= TEXT_MAX or "\0" in item:
+                raise ValueError("invalid disk text")
+            item.encode("utf-8")
+            text[key] = item
+        total = validate_bytes(disk.get("total_bytes"), minimum=1)
+        used = validate_bytes(disk.get("used_bytes"))
+        available = validate_bytes(disk.get("available_bytes"))
+        if used > total or available > total or used + available > total + TOTAL_SLACK:
+            raise ValueError("inconsistent disk totals")
+        clean.append(dict(text, total_bytes=total, used_bytes=used, available_bytes=available))
+    return dict(cpu=cpu, memory=memory, disks=clean)
 
 
 def validate_payload(payload):
@@ -307,7 +513,8 @@ def validate_payload(payload):
         raise ValueError("invalid warnings")
     for warning in warnings:
         warning.encode("utf-8")
-    return dict(collected_at=collected_at, readings=readings, uptime_s=uptime, load1=load, warnings=warnings)
+    return dict(collected_at=collected_at, readings=readings, uptime_s=uptime, load1=load,
+                warnings=warnings, resources=validate_resources(payload.get("resources")))
 
 
 def probe(host, config, dry_run=False):
@@ -477,12 +684,15 @@ def handler_for(collector):
                     self.reply(200, collector.database.labels())
                 elif url.path == "/v1/history":
                     try:
-                        hours, host, bucket = history_params(parse_qs(url.query, keep_blank_values=True, max_num_fields=16))
+                        query = parse_qs(url.query, keep_blank_values=True, max_num_fields=16)
+                        hours, host, bucket = history_params(query)
+                        metric = history_metric(query)
                     except ValueError:
                         self.reply(400, {"error": "Invalid history parameters"})
                         return
                     end = dt.datetime.now(UTC)
-                    self.reply(200, collector.database.history(iso(end - dt.timedelta(hours=hours)), iso(end), host, bucket))
+                    self.reply(200, collector.database.history(iso(end - dt.timedelta(hours=hours)), iso(end),
+                                                               host, bucket, metric))
                 else:
                     self.reply(404, {"error": "Not found"})
             except Exception:

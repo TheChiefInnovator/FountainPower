@@ -12,17 +12,27 @@ role. Check the container's configured admin role if it differs from `coolify`.
 
 ```sh
 docker exec -i coolify-db psql -X -v ON_ERROR_STOP=1 -U coolify -d coolify < temps/sql/001_fountain_temperatures.sql
+docker exec -i coolify-db psql -X -v ON_ERROR_STOP=1 -U coolify -d coolify < temps/sql/003_fountain_host_resources.sql
 docker exec -i coolify-db psql -X -v ON_ERROR_STOP=1 -U fountain_temps_writer -d coolify -c 'SELECT count(*) FROM fountain.host_temperature_samples'
 docker exec -i coolify-db psql -X -v ON_ERROR_STOP=1 -U fountain_temps_reader -d coolify -c 'SELECT count(*) FROM fountain.host_temperature_readings'
+docker exec -i coolify-db psql -X -v ON_ERROR_STOP=1 -U fountain_temps_reader -d coolify -c 'SELECT count(*) FROM fountain.host_disk_samples'
 ```
 
-The migration is transactional and idempotent. Dedicated LOGIN roles have no
-password and depend on the container's existing **local Unix socket trust**.
-Verify that policy before installation; do not enable network trust or expose a
-database port. The writer has INSERT/SELECT, sequence USAGE and DELETE on samples
-for retention; the reader has SELECT only. The cascading foreign key removes
-readings when their sample expires. The extra `sample_id` index also keeps latest
-reads and retention deletes efficient.
+The migrations are transactional and idempotent. **Apply 003 before deploying the
+updated collector**: it adds the CPU/memory/swap columns to the existing sample
+rows and the `fountain.host_disk_samples` table that the new latest, history and
+sweep queries reference. Rows collected before 003 simply have NULL resources, so
+all existing history keeps working unchanged. Re-running 001 or 003 is harmless.
+
+Dedicated LOGIN roles have no password and depend on the container's existing
+**local Unix socket trust**. Verify that policy before installation; do not
+enable network trust or expose a database port. The writer has INSERT/SELECT,
+sequence USAGE and DELETE on samples for retention; the reader has SELECT only.
+The cascading foreign key removes readings and disk rows when their sample
+expires. The extra `sample_id` indexes also keep latest reads and retention
+deletes efficient. Table-level privileges from 001 already cover the new sample
+columns, so 003 only grants the writer INSERT/SELECT and the reader SELECT on
+`fountain.host_disk_samples`.
 
 ## 2. Generate the restricted probe key on FountainSelf
 
@@ -96,6 +106,50 @@ zones are fallback-only. Physical sysfs device paths distinguish matching chips.
 NVIDIA unavailable fields are skipped with warnings. QEMU/DMI detection marks
 HappyBird as virtualized; a valid empty probe is status `ok`.
 
+### Resource metrics: CPU, memory and filesystems
+
+Every sample also carries a `resources` object. A metric that cannot be read is
+`null`, never `0`, and every probe has a timeout. A host with no temperature
+sensors (a VM such as HappyBird) still reports CPU, memory and disk; only its
+temperature readings are empty.
+
+**CPU is short-interval usage, not load average.** On Linux the agent reads
+`/proc/stat`, sleeps `CPU_SAMPLE_SECONDS` (0.25 s by default), reads it again and
+reports the busy share of the elapsed jiffies (idle + iowait subtracted),
+clamped to 0–100; `window_s` records that window. This is a 0.25-second snapshot
+of a five-minute sweep, so it can differ from the interval average — for
+capacity trends prefer the history chart, which averages each bucket. On macOS
+the equivalent is one interval sample from `top -l 2 -n 0 -s 1` (`window_s`
+1.0), with a bounded `ps -A -o %cpu=` fallback normalised by logical core count
+and reported as `window_s: null` because `ps` is a decay average.
+
+**Memory definition.** On Linux, `total_bytes` is `MemTotal` and `used_bytes` is
+`MemTotal − MemAvailable` (kB converted to bytes); if the kernel has no
+`MemAvailable`, `MemFree + Buffers + Cached` is used instead. Swap is reported
+only when `SwapTotal` exists: a host without swap reports `swap_total_bytes` of
+`0` (a genuine zero), while an unreadable metric stays `null`. On macOS,
+`total_bytes` is `sysctl hw.memsize`, `available_bytes` is
+`(Pages free + Pages speculative + Pages inactive) × page size` from `vm_stat`,
+`used_bytes` is `total − available`, and swap comes from `sysctl vm.swapusage`.
+
+**Filesystem definition.** Disk figures come from `statvfs` on each local mount:
+`available_bytes` is `f_bavail` (space an unprivileged writer can actually use),
+`used_bytes` is `total − f_bfree`, and `used + available ≤ total` is always true.
+Only allowlisted real filesystems are reported (`ext2/3/4`, `xfs`, `btrfs`,
+`f2fs`, `bcachefs`, `zfs`, `vfat`, `msdos`, `exfat`, `ntfs`/`ntfs3`, `jfs`,
+`reiserfs`, `ufs`, `hfs`/`hfsplus`, `apfs`), so network mounts (`nfs`, `cifs`,
+`sshfs`), pseudo filesystems (`proc`, `sysfs`, `tmpfs`, `devtmpfs`, `overlay`,
+`cgroup`), `/dev/loop` devices and pseudo mount trees (`/proc`, `/sys`, `/dev`,
+`/run`, `/snap`, `/var/lib/docker`, `/System/Volumes`, CoreSimulator images) are
+excluded. `/proc/self/mounts` octal escapes (`\040` space and friends) are decoded
+before `statvfs`, so paths with spaces work. Duplicate mount points and repeated
+devices (bind mounts) are collapsed by identity — two independent filesystems are
+never dropped just because they report an identical capacity — and at most 32
+filesystems are reported. A mount that cannot be statvfs'd is skipped, never
+zeroed. The collector re-validates each host's report: at most 32 filesystems,
+255-character mount/device/filesystem text, finite and in-range percentages, and
+consistent totals (`used + available ≤ total`) for memory and every filesystem.
+
 ## 4. Install and configure the collector on FountainSelf
 
 ```sh
@@ -165,6 +219,29 @@ History clamps hours to 1–720 and uses 300-second buckets through 24h,
 1800-second buckets through 7d, then 7200 seconds. Series contain bucket maxima;
 missing samples remain gaps (the UI does not bridge long gaps). The latest API
 also includes `last_good_at` and `warnings` for operations. Thresholds are 60/80/90°C.
+The dashboard's thermal charts and every resource chart support drag-to-zoom
+(reverse drags included, clamped to the chart range) with a **Reset zoom** control,
+double-click, and Escape to reset; arrow keys still step through readings.
+
+Resource history is the same `/v1/history` endpoint with an extra `metric`
+parameter: `temp` (default, the behaviour above), `cpu`, `memory` or `disk`. The
+response adds `"metric"` and keeps the `series` shape (`{host,kind,points}`), with
+per-filesystem series adding `mount`. Resource values are bucketed **averages**
+of a percentage — CPU from the stored sample, memory as
+`100 × used / total`, disk as `100 × used / (used + available)` computed in SQL
+from the stored byte counts — and are charted separately from Celsius on a 0–100
+axis. The default `temp` response is byte-for-byte compatible with earlier
+collectors and app versions, and the latest API keeps every legacy field while
+adding per-host `resources` (`cpu`, `memory`, `disks`). A collector that predates
+resources simply omits them, and the dashboard hides the resource section and
+shows the CPU/memory/disk columns as not reported.
+
+On the `/power/temperatures` page the resource overview lists every host's CPU
+percentage, memory used/total, swap and each local filesystem's usage; selecting
+a host expands full sensor and resource detail (CPU window and core count,
+memory and available bytes, swap, and a per-mount table). The **Resource history**
+section has CPU / Memory / Disk selectors that reuse the 6h/24h/7d/30d range
+picker.
 
 ## Shared outlet labels
 
@@ -289,6 +366,9 @@ load the disposable token without printing it:
 temps_token="$(cat /tmp/fountain-temps-local/token)"
 curl --fail -H "Authorization: Bearer ${temps_token}" http://127.0.0.1:3096/v1/latest
 curl --fail -H "Authorization: Bearer ${temps_token}" 'http://127.0.0.1:3096/v1/history?hours=24&bucket=auto'
+curl --fail -H "Authorization: Bearer ${temps_token}" 'http://127.0.0.1:3096/v1/history?hours=24&metric=cpu'
+curl --fail -H "Authorization: Bearer ${temps_token}" 'http://127.0.0.1:3096/v1/history?hours=24&metric=memory'
+curl --fail -H "Authorization: Bearer ${temps_token}" 'http://127.0.0.1:3096/v1/history?hours=24&metric=disk'
 POWER_TEMPS_API_URL=http://127.0.0.1:3096 POWER_TEMPS_API_TOKEN="$temps_token" pnpm dev
 ```
 
@@ -299,11 +379,15 @@ SSH or Docker, and uses in-memory retention/history. It deliberately refuses a
 host list without explicit `transport: local`. The tests construct sysfs trees
 and mock subprocess responses; no host probes or database writes are involved.
 
-For visual preview with CPU/GPU/NVMe curves, thresholds, an empty VM and a failed
-host (all synthetic), run `python3 temps/tests/fixture_collector.py --token-file
+For visual preview with CPU/GPU/NVMe temperature curves, resource tiles and
+CPU/memory/disk percentage charts, thresholds, an empty VM and a failed host (all
+synthetic), run `python3 temps/tests/fixture_collector.py --token-file
 /tmp/fountain-temps-local/token --port 3097`, then point the local Power server at
-`http://127.0.0.1:3097`. This separate test server does not run probes. It uses a
-fixed 24-hour dataset seeded at startup; restart it for fresh timestamps.
+`http://127.0.0.1:3097`. This separate test server does not run probes. It seeds a
+fixed 24-hour dataset of temperatures and CPU/memory/disk percentages at startup;
+restart it for fresh timestamps. Until migration 003 and the updated collector are
+deployed on FountainSelf, a real collector reports no resources and the dashboard
+shows the resource columns as not reported.
 
 ## Rollback
 
@@ -315,7 +399,16 @@ fixed 24-hour dataset seeded at startup; restart it for fresh timestamps.
 3. Remove only the `fountain-temps-collector` forced-command authorized key line
    from each host, then remove `/usr/local/bin/fountain-temps`. Remove the
    collector key, token and config under `/etc/fountain-temps` securely.
-4. Keep the isolated `fountain` schema for history by default. If destruction is
+4. To roll the resource extension back without data loss, deploy the previous
+   collector and app: the new columns stay NULL and `fountain.host_disk_samples`
+   simply stops receiving rows, so the old temperature-only queries keep working.
+   Alternatively drop only the resource objects with `ALTER TABLE
+   fountain.host_temperature_samples DROP COLUMN cpu_percent, DROP COLUMN
+   cpu_cores, DROP COLUMN cpu_window_s, DROP COLUMN memory_total_bytes, DROP
+   COLUMN memory_used_bytes, DROP COLUMN memory_available_bytes, DROP COLUMN
+   swap_total_bytes, DROP COLUMN swap_used_bytes;` and `DROP TABLE
+   fountain.host_disk_samples;`. This discards resource history only.
+5. Keep the isolated `fountain` schema for history by default. If destruction is
    explicitly approved and no other objects have been added to this schema, a DB
    administrator may run `DROP SCHEMA fountain CASCADE; DROP ROLE
    fountain_temps_reader; DROP ROLE fountain_temps_writer;` inside `coolify-db`.

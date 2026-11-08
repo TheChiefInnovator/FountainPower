@@ -29,12 +29,16 @@ export async function GET(request: NextRequest) {
   if (view === "history") {
     const hours = Number(query.get("hours") ?? 24);
     const host = query.get("host");
+    const metric = query.get("metric") ?? "temp";
+    const validMetric = metric === "temp" || metric === "cpu" || metric === "memory" || metric === "disk";
     if (!Number.isInteger(hours) || (host !== null && !/^[A-Za-z0-9-]{1,64}$/.test(host)) ||
-        (query.has("bucket") && query.get("bucket") !== "auto")) {
+        (query.has("bucket") && query.get("bucket") !== "auto") || !validMetric) {
       return reply({ error: "Invalid history parameters" }, 400);
     }
     params.set("hours", String(Math.min(720, Math.max(1, hours))));
     params.set("bucket", "auto");
+    // Omitted for the legacy temperature view so old clients keep the old response.
+    if (metric !== "temp") params.set("metric", metric);
     if (host) params.set("host", host);
   }
 

@@ -29,14 +29,33 @@ def main():
         samples = []
         for index, name in enumerate(names):
             readings = []
+            resources = None
             failed = name == "OfflineHost" and step > 250
-            if name != "HappyBird" and not failed:
-                for kind, offset in (("cpu", 0), ("gpu", 18), ("nvme", -10)):
-                    readings.append(dict(kind=kind, chip="fixture", device=f"pci-0000:0{index}:00.0", label=f"{kind.upper()} fixture sensor",
-                                         celsius=round(53 + offset + 12 * math.sin(step / 15 + index), 1), max=None, crit=95))
+            if not failed:
+                if name != "HappyBird":
+                    for kind, offset in (("cpu", 0), ("gpu", 18), ("nvme", -10)):
+                        readings.append(dict(kind=kind, chip="fixture", device=f"pci-0000:0{index}:00.0", label=f"{kind.upper()} fixture sensor",
+                                             celsius=round(53 + offset + 12 * math.sin(step / 15 + index), 1), max=None, crit=95))
+                memory_total = 16 * 1024 ** 3
+                memory_used = int(min(0.95, max(0.10, 0.50 + 0.30 * math.sin(step / 17 + index))) * memory_total)
+                swap_total = 4 * 1024 ** 3
+                disks = []
+                if name != "HappyBird":
+                    for mount, device, total, ratio in (("/", "/dev/nvme0n1p2", 500 * 1024 ** 3, 0.62),
+                                                        ("/data", "/dev/nvme1n1p1", 2000 * 1024 ** 3, 0.41)):
+                        used = int(min(0.97, max(0.05, ratio + 0.12 * math.sin(step / 23 + index))) * total)
+                        disks.append(dict(mount=mount, device=device, fstype="btrfs" if mount == "/" else "xfs",
+                                          total_bytes=total, used_bytes=used, available_bytes=total - used))
+                resources = dict(
+                    cpu=dict(usage_percent=round(min(100.0, max(0.0, 28 + 22 * math.sin(step / 9 + index))), 1),
+                             cores=[4, 8, 16, 8][index], window_s=0.25),
+                    memory=dict(total_bytes=memory_total, used_bytes=memory_used, available_bytes=memory_total - memory_used,
+                                swap_total_bytes=swap_total, swap_used_bytes=int(0.05 * swap_total)),
+                    disks=disks)
             samples.append(dict(host=name, status="unreachable" if failed else "ok", error="SSH connection failed" if failed else None,
                                 collected_at=None if failed else at, uptime_s=None if failed else 123456, load1=None if failed else 1.23,
-                                readings=readings, warnings=["Virtual machine; no temperature sensors"] if name == "HappyBird" else []))
+                                readings=readings, resources=resources,
+                                warnings=["Virtual machine; no temperature sensors"] if name == "HappyBird" else []))
         db.store(samples, at, None)
     service = core.Collector(dict(hosts=[dict(name=name) for name in names]), token, db, True)
     service.last_sweep_at = core.iso(now)
